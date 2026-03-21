@@ -28,6 +28,7 @@ setup(
             'ros_bridge = wildfire_agents.ros_bridge:main',
             'fire_grid_node = wildfire_agents.fire_grid_node:main',
             'viz_renderer = wildfire_agents.viz_renderer:main',
+            'foxglove_viz = wildfire_agents.foxglove_viz:main',
             'scene_publisher_3d = wildfire_agents.scene_publisher_3d:main',
         ],
     },

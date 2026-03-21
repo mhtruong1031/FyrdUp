@@ -71,7 +71,7 @@ class ScoutAgent:
 
         self.latest_image = None
         self.fire_grid = None
-        self.grid_size = 20
+        self.grid_size = 50
 
         self.fire_map = None
 
@@ -83,18 +83,37 @@ class ScoutAgent:
 
         @self.agent.on_interval(period=self.analysis_interval)
         async def analyze_and_command(ctx: Context):
+            ctx.logger.info(
+                f'[SCOUT] === Analysis tick === '
+                f'registered={list(self.firefighter_addresses.keys())} '
+                f'status_count={len(self.firefighter_status)} '
+                f'mode={"VLM" if self.use_vlm else "grid"}')
+
             if self.use_vlm:
                 if self.latest_image is None:
-                    ctx.logger.info('No camera image available yet')
+                    ctx.logger.warning('[SCOUT] No camera image available yet — skipping')
                     return
+                ctx.logger.info(f'[SCOUT] Running VLM analysis on image...')
                 fire_analysis = await self.vlm.analyze_fire(self.latest_image)
             else:
                 if self.fire_grid is None:
-                    ctx.logger.info('Waiting for fire grid data...')
+                    ctx.logger.warning('[SCOUT] No fire grid data yet — skipping')
                     return
+                ctx.logger.info('[SCOUT] Running grid-based analysis...')
                 fire_analysis = self._analyze_fire_grid()
 
-            ctx.logger.info(f"Fire analysis: {fire_analysis['analysis']}")
+            n_fires = len(fire_analysis.get('fire_locations', []))
+            n_recs = len(fire_analysis.get('recommended_positions', []))
+            ctx.logger.info(
+                f'[SCOUT] Analysis result: '
+                f'fires={n_fires} recommended_pos={n_recs} '
+                f'threat={fire_analysis.get("threat_level", "?")} '
+                f'| {fire_analysis.get("analysis", "")}')
+
+            if n_recs == 0:
+                ctx.logger.warning(
+                    '[SCOUT] No recommended positions from analysis — '
+                    'no commands will be sent')
 
             self.fire_map = FireMap(
                 fire_locations=fire_analysis['fire_locations'],
@@ -103,20 +122,43 @@ class ScoutAgent:
                 threat_level=fire_analysis['threat_level'],
             )
 
+            if not self.firefighter_status:
+                ctx.logger.warning(
+                    '[SCOUT] firefighter_status is EMPTY — '
+                    'no firefighters have reported in. '
+                    'Cannot allocate. Are StatusUpdates arriving?')
+
             commands = self._allocate_firefighters(
-                fire_analysis['recommended_positions'])
+                fire_analysis['recommended_positions'], ctx)
+
+            ctx.logger.info(
+                f'[SCOUT] Allocation produced {len(commands)} commands '
+                f'for {len(self.firefighter_status)} known firefighters')
 
             for cmd in commands:
                 if cmd.target_id in self.firefighter_addresses:
-                    await ctx.send(
-                        self.firefighter_addresses[cmd.target_id], cmd)
+                    addr = self.firefighter_addresses[cmd.target_id]
+                    await ctx.send(addr, cmd)
                     ctx.logger.info(
-                        f'Sent move to {cmd.target_id}: '
-                        f'({cmd.position[0]:.1f}, {cmd.position[1]:.1f}), '
-                        f'priority {cmd.priority}')
+                        f'[SCOUT] Sent MoveCommand to {cmd.target_id} '
+                        f'addr={addr[:20]}... '
+                        f'pos=({cmd.position[0]:.1f}, {cmd.position[1]:.1f}) '
+                        f'priority={cmd.priority} '
+                        f'fire_cell={cmd.fire_cell}')
+                else:
+                    ctx.logger.warning(
+                        f'[SCOUT] Cannot send to {cmd.target_id} — '
+                        f'no address registered! '
+                        f'Known addresses: {list(self.firefighter_addresses.keys())}')
 
         @self.agent.on_message(model=StatusUpdate)
         async def handle_status(ctx: Context, sender: str, msg: StatusUpdate):
+            ctx.logger.info(
+                f'[SCOUT] StatusUpdate from {msg.firefighter_id}: '
+                f'state={msg.state} water={msg.water_level:.0f}% '
+                f'pos=({msg.position[0]:.1f}, {msg.position[1]:.1f}) '
+                f'sender={sender[:20]}...')
+
             self.firefighter_status[msg.firefighter_id] = {
                 'position': msg.position,
                 'water_level': msg.water_level,
@@ -126,7 +168,10 @@ class ScoutAgent:
 
             if msg.firefighter_id not in self.firefighter_addresses:
                 self.firefighter_addresses[msg.firefighter_id] = sender
-                ctx.logger.info(f'Registered firefighter: {msg.firefighter_id}')
+                ctx.logger.info(
+                    f'[SCOUT] NEW firefighter registered: {msg.firefighter_id} '
+                    f'addr={sender[:20]}... '
+                    f'total_registered={len(self.firefighter_addresses)}')
 
             if msg.water_level < 20.0 and msg.state != 'REFILLING':
                 refill_cmd = RefillCommand(
@@ -135,18 +180,35 @@ class ScoutAgent:
                 )
                 await ctx.send(sender, refill_cmd)
                 ctx.logger.info(
-                    f'Sent refill to {msg.firefighter_id} '
-                    f'(water {msg.water_level:.1f}%)')
+                    f'[SCOUT] Sent RefillCommand to {msg.firefighter_id} '
+                    f'(water={msg.water_level:.1f}%)')
 
     # -- allocation ----------------------------------------------------------
 
-    def _allocate_firefighters(self, recommended_positions: List) -> List[MoveCommand]:
+    def _allocate_firefighters(self, recommended_positions: List,
+                               ctx: Context = None) -> List[MoveCommand]:
         commands = []
+        _log = ctx.logger.info if ctx else (lambda m: None)
+        _warn = ctx.logger.warning if ctx else (lambda m: None)
 
         available = []
         for ff_id, status in self.firefighter_status.items():
             if status['state'] in ('IDLE', 'MOVING') and status['water_level'] > 20.0:
                 available.append((ff_id, status['position']))
+                _log(f'[SCOUT] Allocate: {ff_id} AVAILABLE '
+                     f'state={status["state"]} water={status["water_level"]:.0f}%')
+            else:
+                _log(f'[SCOUT] Allocate: {ff_id} SKIPPED '
+                     f'state={status["state"]} water={status["water_level"]:.0f}%')
+
+        if not available:
+            _warn('[SCOUT] Allocate: NO available firefighters '
+                  '(need state IDLE/MOVING and water > 20%)')
+        if not recommended_positions:
+            _warn('[SCOUT] Allocate: NO recommended positions to assign')
+
+        _log(f'[SCOUT] Allocate: {len(available)} available, '
+             f'{len(recommended_positions)} positions to fill')
 
         assigned_positions = set()
         for ff_id, ff_pos in available:
@@ -177,6 +239,10 @@ class ScoutAgent:
                     priority=100 - int(min_dist * 10),
                     fire_cell=recommended_positions[best_idx],
                 ))
+                _log(f'[SCOUT] Allocate: ASSIGNED {ff_id} -> '
+                     f'grid={recommended_positions[best_idx]} '
+                     f'world=({best_pos[0]:.1f}, {best_pos[1]:.1f}) '
+                     f'dist={min_dist:.1f}')
 
         return commands
 

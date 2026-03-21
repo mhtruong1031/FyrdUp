@@ -16,6 +16,10 @@ class NavigationController(Node):
         if not self.robot_name:
             self.robot_name = 'firefighter_1'
 
+        self._tag = f'[NAV:{self.robot_name}]'
+        self._control_tick = 0
+        self._odom_count = 0
+
         self.declare_parameter('linear_speed', 0.5)
         self.declare_parameter('angular_speed', 1.0)
         self.declare_parameter('position_tolerance', 0.3)
@@ -41,7 +45,11 @@ class NavigationController(Node):
         self.create_timer(0.1, self._control_loop)
 
         self.get_logger().info(
-            f'{self.robot_name} navigation controller initialized')
+            f'{self._tag} Initialized — '
+            f'subscribing to /{self.robot_name}/odometry, '
+            f'/{self.robot_name}/target_position | '
+            f'publishing /{self.robot_name}/cmd_vel | '
+            f'speed={self.linear_speed} tol={self.position_tolerance}')
 
     def _odom_cb(self, msg):
         self.current_position = msg.pose.pose.position
@@ -49,14 +57,29 @@ class NavigationController(Node):
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
         self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+        self._odom_count += 1
+        if self._odom_count % 100 == 1:
+            self.get_logger().info(
+                f'{self._tag} Odom #{self._odom_count} '
+                f'pos=({self.current_position.x:.1f}, '
+                f'{self.current_position.y:.1f}) '
+                f'yaw={math.degrees(self.current_yaw):.0f}°')
 
     def _target_cb(self, msg):
         self.target_position = msg
         self.get_logger().info(
-            f'{self.robot_name} new target: ({msg.x:.2f}, {msg.y:.2f})')
+            f'{self._tag} NEW TARGET received: '
+            f'({msg.x:.2f}, {msg.y:.2f}) '
+            f'current_pos=({self.current_position.x:.1f}, '
+            f'{self.current_position.y:.1f})')
 
     def _control_loop(self):
+        self._control_tick += 1
         if self.target_position is None:
+            if self._control_tick % 200 == 0:
+                self.get_logger().info(
+                    f'{self._tag} No target — idle '
+                    f'(odom_received={self._odom_count})')
             return
 
         dx = self.target_position.x - self.current_position.x
@@ -75,14 +98,28 @@ class NavigationController(Node):
         if distance < self.position_tolerance:
             cmd.linear.x = 0.0
             cmd.angular.z = 0.0
-            self.get_logger().info(f'{self.robot_name} reached target')
+            self.get_logger().info(
+                f'{self._tag} REACHED target '
+                f'({self.target_position.x:.1f}, '
+                f'{self.target_position.y:.1f})')
             self.target_position = None
         elif abs(angle_error) > 0.2:
             cmd.linear.x = 0.0
             cmd.angular.z = self.angular_speed if angle_error > 0 else -self.angular_speed
+            if self._control_tick % 20 == 0:
+                self.get_logger().info(
+                    f'{self._tag} TURNING '
+                    f'angle_err={math.degrees(angle_error):.0f}° '
+                    f'dist={distance:.1f}')
         else:
             cmd.linear.x = min(self.linear_speed, distance)
             cmd.angular.z = 0.5 * angle_error
+            if self._control_tick % 20 == 0:
+                self.get_logger().info(
+                    f'{self._tag} DRIVING '
+                    f'dist={distance:.1f} '
+                    f'vel={cmd.linear.x:.2f} '
+                    f'angle_err={math.degrees(angle_error):.0f}°')
 
         self.cmd_vel_pub.publish(cmd)
 

@@ -4,5 +4,6 @@ numpy>=1.24.0
 google-generativeai>=0.8.0
 rich>=13.7.0
 cv-bridge
+foxglove-sdk
 nest_asyncio
 pyyaml>=6.0

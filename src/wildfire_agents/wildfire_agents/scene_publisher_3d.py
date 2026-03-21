@@ -2,28 +2,29 @@
 """
 3D scene publisher for Foxglove Studio visualization.
 
-Subscribes to /fire_grid and robot odometry, publishes MarkerArrays that
-Foxglove's 3D panel renders natively.  Terrain and trees are procedurally
-generated once at startup; fire and robot markers update in real time.
+Subscribes to /fire_grid and robot odometry, publishes 3D scene updates
+via the foxglove-sdk (SceneUpdate) so Foxglove's 3D panel can render
+procedural terrain, trees, rocks, fire, and robots — no foxglove_bridge
+ROS package required.
+
+Connects to the foxglove server started by foxglove_viz on port 8766.
 """
 
 import math
 import os
+import time
 import random as _random
 
 import numpy as np
 
+import foxglove
+from foxglove import schemas as fgs
+
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, DurabilityPolicy
-
-from builtin_interfaces.msg import Duration
-from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
-from std_msgs.msg import ColorRGBA, Float32
-from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import Float32
 from wildfire_msgs.msg import FireGrid
-from tf2_ros import StaticTransformBroadcaster
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +33,7 @@ from tf2_ros import StaticTransformBroadcaster
 
 _PERM = list(range(256))
 _random.Random(42).shuffle(_PERM)
-_PERM *= 2  # double for wrap-around
+_PERM *= 2
 
 
 def _fade(t):
@@ -44,7 +45,6 @@ def _lerp(a, b, t):
 
 
 def _value_noise_2d(x, y):
-    """Simple 2-D value noise in [0, 1]."""
     xi = int(math.floor(x)) & 255
     yi = int(math.floor(y)) & 255
     xf = x - math.floor(x)
@@ -61,7 +61,6 @@ def _value_noise_2d(x, y):
 
 
 def _fbm(x, y, octaves=4, lacunarity=2.0, gain=0.5):
-    """Fractal Brownian Motion layered on value noise."""
     val = 0.0
     amp = 1.0
     freq = 1.0
@@ -73,24 +72,31 @@ def _fbm(x, y, octaves=4, lacunarity=2.0, gain=0.5):
 
 
 # ---------------------------------------------------------------------------
-# Color helpers
+# Foxglove helpers
 # ---------------------------------------------------------------------------
 
-def _rgba(r, g, b, a=1.0):
-    c = ColorRGBA()
-    c.r, c.g, c.b, c.a = float(r), float(g), float(b), float(a)
-    return c
+def _fg_pose(x, y, z):
+    return fgs.Pose(
+        position=fgs.Vector3(x=x, y=y, z=z),
+        orientation=fgs.Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
+    )
 
 
-def _duration(sec=0, nanosec=0):
-    d = Duration()
-    d.sec = sec
-    d.nanosec = nanosec
-    return d
+def _fg_color(r, g, b, a=1.0):
+    return fgs.Color(r=r, g=g, b=b, a=a)
+
+
+def _fg_vec3(x, y, z):
+    return fgs.Vector3(x=x, y=y, z=z)
+
+
+def _fg_ts():
+    t = time.time_ns()
+    return fgs.Timestamp(sec=t // 1_000_000_000, nsec=t % 1_000_000_000)
 
 
 # ---------------------------------------------------------------------------
-# Node
+# Constants
 # ---------------------------------------------------------------------------
 
 TERRAIN_NOISE_SCALE = 0.25
@@ -99,6 +105,7 @@ TREE_COUNT = 100
 TREE_SEED = 12345
 ROCK_COUNT = 30
 ROCK_SEED = 67890
+FRAME_ID = 'world'
 
 
 class ScenePublisher3D(Node):
@@ -107,50 +114,34 @@ class ScenePublisher3D(Node):
         super().__init__('scene_publisher_3d')
 
         num_ff = int(os.environ.get('NUM_FIREFIGHTERS', '4'))
-        self._grid_size = 20
+        self._grid_size = 50
         self._cell_size = 1.0
         self._half_world = self._grid_size * self._cell_size / 2.0
 
-        # --- publishers (latched via transient_local for static markers) ---
-        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        foxglove.start_server(port=8766)
 
-        self._pub_terrain = self.create_publisher(
-            MarkerArray, '/viz/terrain_markers', latched)
-        self._pub_trees = self.create_publisher(
-            MarkerArray, '/viz/tree_markers', latched)
-        self._pub_rocks = self.create_publisher(
-            MarkerArray, '/viz/rock_markers', latched)
-        self._pub_fire = self.create_publisher(
-            MarkerArray, '/viz/fire_markers', 10)
-        self._pub_robots = self.create_publisher(
-            MarkerArray, '/viz/robot_markers', 10)
-
-        # --- static TF: world frame identity ---
-        self._tf_broadcaster = StaticTransformBroadcaster(self)
-        self._publish_static_tf()
-
-        # --- terrain height cache (grid_size x grid_size) ---
+        # --- terrain height cache ---
         self._terrain_h = self._build_terrain_heights()
 
         # --- procedural geometry (built once) ---
-        self._terrain_msg = self._build_terrain_markers()
         self._tree_positions = []
-        self._tree_msg = self._build_tree_markers()
-        self._rock_msg = self._build_rock_markers()
+        self._tree_data = []
+        self._terrain_entity = self._build_terrain_entity()
+        self._tree_entity = self._build_tree_entity()
+        self._rock_entity = self._build_rock_entity()
 
-        # publish static markers once now (and re-publish on a slow timer for
-        # late-joining Foxglove connections)
+        # publish static scene once, then re-publish slowly for late joiners
         self._publish_static()
         self.create_timer(5.0, self._publish_static)
 
         # --- robot state ---
         self._ff_pos = {}
         self._ff_water = {}
-        self._scout_pos = (0.0, 0.0, 5.0)
+        self._scout_pos = (0.0, -12.0, 5.0)
 
         for i in range(num_ff):
             fid = f'firefighter_{i + 1}'
-            self._ff_pos[fid] = (0.0, 0.0, 0.0)
+            self._ff_pos[fid] = (0.0, -12.0, 0.0)
             self._ff_water[fid] = 100.0
             self.create_subscription(
                 Odometry, f'/{fid}/odometry',
@@ -162,28 +153,14 @@ class ScenePublisher3D(Node):
         self.create_subscription(
             Odometry, '/scout/odometry', self._scout_odom_cb, 10)
 
-        # --- fire grid subscription ---
         self._last_fire = None
         self.create_subscription(FireGrid, '/fire_grid', self._fire_cb, 10)
 
-        # timer for robot markers (5 Hz)
         self.create_timer(0.2, self._publish_robots)
 
         self.get_logger().info(
-            f'ScenePublisher3D started — {num_ff} firefighters, '
+            f'ScenePublisher3D started — ws://localhost:8766 — {num_ff} firefighters, '
             f'{TREE_COUNT} trees, {ROCK_COUNT} rocks')
-
-    # -----------------------------------------------------------------------
-    # Static TF
-    # -----------------------------------------------------------------------
-
-    def _publish_static_tf(self):
-        t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = 'world'
-        t.child_frame_id = 'map'
-        t.transform.rotation.w = 1.0
-        self._tf_broadcaster.sendTransform(t)
 
     # -----------------------------------------------------------------------
     # Terrain generation
@@ -197,64 +174,46 @@ class ScenePublisher3D(Node):
             for gx in range(n):
                 wx = (gx - n / 2.0 + 0.5) * cs
                 wy = (gy - n / 2.0 + 0.5) * cs
-                h[gy, gx] = _fbm(
-                    wx * TERRAIN_NOISE_SCALE,
-                    wy * TERRAIN_NOISE_SCALE,
-                ) * TERRAIN_HEIGHT_AMP
+                h[gy, gx] = _fbm(wx * TERRAIN_NOISE_SCALE, wy * TERRAIN_NOISE_SCALE) * TERRAIN_HEIGHT_AMP
         return h
 
-    def _build_terrain_markers(self):
-        ma = MarkerArray()
+    def _build_terrain_entity(self):
         n = self._grid_size
         cs = self._cell_size
-        stamp = self.get_clock().now().to_msg()
-
+        cubes = []
         for gy in range(n):
             for gx in range(n):
-                m = Marker()
-                m.header.stamp = stamp
-                m.header.frame_id = 'world'
-                m.ns = 'terrain'
-                m.id = gy * n + gx
-                m.type = Marker.CUBE
-                m.action = Marker.ADD
-                m.lifetime = _duration()
-
                 h = float(self._terrain_h[gy, gx])
                 wx = (gx - n / 2.0 + 0.5) * cs
                 wy = (gy - n / 2.0 + 0.5) * cs
-
-                m.pose.position.x = wx
-                m.pose.position.y = wy
-                m.pose.position.z = h / 2.0
-                m.pose.orientation.w = 1.0
-
                 tile_h = max(0.05, abs(h) + 0.05)
-                m.scale.x = cs * 0.98
-                m.scale.y = cs * 0.98
-                m.scale.z = tile_h
 
-                t = np.clip((h / TERRAIN_HEIGHT_AMP + 1.0) / 2.0, 0.0, 1.0)
+                t = float(np.clip((h / TERRAIN_HEIGHT_AMP + 1.0) / 2.0, 0.0, 1.0))
                 gr = 0.25 + 0.35 * (1.0 - t)
                 gg = 0.40 + 0.30 * (1.0 - t)
                 gb = 0.15 + 0.10 * t
-                m.color = _rgba(gr, gg, gb)
 
-                ma.markers.append(m)
+                cubes.append(fgs.CubePrimitive(
+                    pose=_fg_pose(wx, wy, h / 2.0),
+                    size=_fg_vec3(cs * 0.98, cs * 0.98, tile_h),
+                    color=_fg_color(gr, gg, gb),
+                ))
 
-        return ma
+        return fgs.SceneEntity(
+            timestamp=_fg_ts(), frame_id=FRAME_ID, id='terrain',
+            lifetime=fgs.Duration(sec=0, nsec=0),
+            frame_locked=True, cubes=cubes,
+        )
 
     # -----------------------------------------------------------------------
-    # Tree generation (Poisson-disc-ish via rejection sampling)
+    # Trees
     # -----------------------------------------------------------------------
 
-    def _build_tree_markers(self):
-        ma = MarkerArray()
+    def _build_tree_entity(self):
         rng = _random.Random(TREE_SEED)
         n = self._grid_size
         cs = self._cell_size
         half = self._half_world
-        stamp = self.get_clock().now().to_msg()
         min_dist = 1.2
 
         positions = []
@@ -263,87 +222,62 @@ class ScenePublisher3D(Node):
             attempts += 1
             wx = rng.uniform(-half + 0.5, half - 0.5)
             wy = rng.uniform(-half + 0.5, half - 0.5)
-            # keep away from the water supply at origin
             if math.hypot(wx, wy) < 2.0:
                 continue
-            too_close = False
-            for px, py, _ in positions:
-                if math.hypot(wx - px, wy - py) < min_dist:
-                    too_close = True
-                    break
+            too_close = any(math.hypot(wx - px, wy - py) < min_dist for px, py, _ in positions)
             if too_close:
                 continue
-            gx = int((wx + half) / cs)
-            gy = int((wy + half) / cs)
-            gx = max(0, min(gx, n - 1))
-            gy = max(0, min(gy, n - 1))
-            ground_z = float(self._terrain_h[gy, gx])
-            positions.append((wx, wy, ground_z))
+            gx = max(0, min(int((wx + half) / cs), n - 1))
+            gy = max(0, min(int((wy + half) / cs), n - 1))
+            gz = float(self._terrain_h[gy, gx])
+            positions.append((wx, wy, gz))
 
         self._tree_positions = positions
 
-        for i, (wx, wy, gz) in enumerate(positions):
+        cylinders = []
+        spheres = []
+        tree_data = []
+        for wx, wy, gz in positions:
             trunk_h = rng.uniform(1.0, 2.5)
             canopy_r = rng.uniform(0.5, 1.0)
+            tree_data.append((trunk_h, canopy_r))
 
-            # trunk (cylinder)
-            m = Marker()
-            m.header.stamp = stamp
-            m.header.frame_id = 'world'
-            m.ns = 'tree_trunk'
-            m.id = i
-            m.type = Marker.CYLINDER
-            m.action = Marker.ADD
-            m.lifetime = _duration()
-            m.pose.position.x = wx
-            m.pose.position.y = wy
-            m.pose.position.z = gz + trunk_h / 2.0
-            m.pose.orientation.w = 1.0
-            m.scale.x = 0.15
-            m.scale.y = 0.15
-            m.scale.z = trunk_h
-            m.color = _rgba(0.36, 0.25, 0.13)
-            ma.markers.append(m)
+            cylinders.append(fgs.CylinderPrimitive(
+                pose=_fg_pose(wx, wy, gz + trunk_h / 2.0),
+                size=_fg_vec3(0.15, 0.15, trunk_h),
+                color=_fg_color(0.36, 0.25, 0.13),
+            ))
 
-            # canopy (sphere)
-            m2 = Marker()
-            m2.header.stamp = stamp
-            m2.header.frame_id = 'world'
-            m2.ns = 'tree_canopy'
-            m2.id = i
-            m2.type = Marker.SPHERE
-            m2.action = Marker.ADD
-            m2.lifetime = _duration()
-            m2.pose.position.x = wx
-            m2.pose.position.y = wy
-            m2.pose.position.z = gz + trunk_h + canopy_r * 0.6
-            m2.pose.orientation.w = 1.0
-            m2.scale.x = canopy_r * 2.0
-            m2.scale.y = canopy_r * 2.0
-            m2.scale.z = canopy_r * 1.6
             shade = rng.uniform(0.0, 1.0)
-            m2.color = _rgba(
-                0.10 + 0.15 * shade,
-                0.35 + 0.30 * (1.0 - shade),
-                0.05 + 0.10 * shade,
-            )
-            ma.markers.append(m2)
+            spheres.append(fgs.SpherePrimitive(
+                pose=_fg_pose(wx, wy, gz + trunk_h + canopy_r * 0.6),
+                size=_fg_vec3(canopy_r * 2.0, canopy_r * 2.0, canopy_r * 1.6),
+                color=_fg_color(
+                    0.10 + 0.15 * shade,
+                    0.35 + 0.30 * (1.0 - shade),
+                    0.05 + 0.10 * shade,
+                ),
+            ))
 
-        return ma
+        self._tree_data = tree_data
+        return fgs.SceneEntity(
+            timestamp=_fg_ts(), frame_id=FRAME_ID, id='trees',
+            lifetime=fgs.Duration(sec=0, nsec=0),
+            frame_locked=True, cylinders=cylinders, spheres=spheres,
+        )
 
     # -----------------------------------------------------------------------
-    # Rock generation
+    # Rocks
     # -----------------------------------------------------------------------
 
-    def _build_rock_markers(self):
-        ma = MarkerArray()
+    def _build_rock_entity(self):
         rng = _random.Random(ROCK_SEED)
         n = self._grid_size
         cs = self._cell_size
         half = self._half_world
-        stamp = self.get_clock().now().to_msg()
+        spheres = []
 
-        for i in range(ROCK_COUNT):
+        for _ in range(ROCK_COUNT):
             wx = rng.uniform(-half + 0.5, half - 0.5)
             wy = rng.uniform(-half + 0.5, half - 0.5)
             if math.hypot(wx, wy) < 1.5:
@@ -352,38 +286,39 @@ class ScenePublisher3D(Node):
             gy = max(0, min(int((wy + half) / cs), n - 1))
             gz = float(self._terrain_h[gy, gx])
 
-            m = Marker()
-            m.header.stamp = stamp
-            m.header.frame_id = 'world'
-            m.ns = 'rocks'
-            m.id = i
-            m.type = Marker.SPHERE
-            m.action = Marker.ADD
-            m.lifetime = _duration()
             rx = rng.uniform(0.2, 0.6)
             ry = rng.uniform(0.2, 0.6)
             rz = rng.uniform(0.15, 0.35)
-            m.pose.position.x = wx
-            m.pose.position.y = wy
-            m.pose.position.z = gz + rz / 2.0
-            m.pose.orientation.w = 1.0
-            m.scale.x = rx
-            m.scale.y = ry
-            m.scale.z = rz
             grey = rng.uniform(0.35, 0.55)
-            m.color = _rgba(grey, grey * 0.95, grey * 0.90)
-            ma.markers.append(m)
+            spheres.append(fgs.SpherePrimitive(
+                pose=_fg_pose(wx, wy, gz + rz / 2.0),
+                size=_fg_vec3(rx, ry, rz),
+                color=_fg_color(grey, grey * 0.95, grey * 0.90),
+            ))
 
-        return ma
+        return fgs.SceneEntity(
+            timestamp=_fg_ts(), frame_id=FRAME_ID, id='rocks',
+            lifetime=fgs.Duration(sec=0, nsec=0),
+            frame_locked=True, spheres=spheres,
+        )
 
     # -----------------------------------------------------------------------
-    # Publish helpers
+    # Publish static scene
     # -----------------------------------------------------------------------
 
     def _publish_static(self):
-        self._pub_terrain.publish(self._terrain_msg)
-        self._pub_trees.publish(self._tree_msg)
-        self._pub_rocks.publish(self._rock_msg)
+        foxglove.log('/tf', fgs.FrameTransform(
+            timestamp=_fg_ts(),
+            parent_frame_id='',
+            child_frame_id='world',
+            translation=fgs.Vector3(x=0.0, y=0.0, z=0.0),
+            rotation=fgs.Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
+        ))
+        foxglove.log('/scene', fgs.SceneUpdate(entities=[
+            self._terrain_entity,
+            self._tree_entity,
+            self._rock_entity,
+        ]))
 
     # -----------------------------------------------------------------------
     # Callbacks
@@ -405,16 +340,17 @@ class ScenePublisher3D(Node):
         self._publish_fire(msg)
 
     # -----------------------------------------------------------------------
-    # Fire markers (updated every fire grid tick)
+    # Fire (updated every fire grid tick)
     # -----------------------------------------------------------------------
 
     def _publish_fire(self, msg: FireGrid):
-        ma = MarkerArray()
         n = msg.width
         cs = msg.cell_size
         half = n * cs / 2.0
-        stamp = self.get_clock().now().to_msg()
-        mid = 0
+        ts = _fg_ts()
+
+        fire_cubes = []
+        burn_spheres = []
 
         for gy in range(n):
             for gx in range(n):
@@ -422,47 +358,18 @@ class ScenePublisher3D(Node):
                 if val < 0.01:
                     continue
 
-                m = Marker()
-                m.header.stamp = stamp
-                m.header.frame_id = 'world'
-                m.ns = 'fire'
-                m.id = mid
-                mid += 1
-                m.type = Marker.CUBE
-                m.action = Marker.ADD
-                m.lifetime = _duration(sec=2)
-
                 wx = (gx - n / 2.0 + 0.5) * cs
                 wy = (gy - n / 2.0 + 0.5) * cs
                 gz = float(self._terrain_h[gy, gx]) if gy < self._grid_size and gx < self._grid_size else 0.0
-                fire_h = val * 2.0
+                fire_h = max(0.05, val * 2.0)
 
-                m.pose.position.x = wx
-                m.pose.position.y = wy
-                m.pose.position.z = gz + fire_h / 2.0
-                m.pose.orientation.w = 1.0
+                fire_cubes.append(fgs.CubePrimitive(
+                    pose=_fg_pose(wx, wy, gz + fire_h / 2.0),
+                    size=_fg_vec3(cs * 0.9, cs * 0.9, fire_h),
+                    color=_fg_color(1.0, max(0.0, 0.6 * (1.0 - val)), 0.0, 0.65 + 0.30 * val),
+                ))
 
-                m.scale.x = cs * 0.9
-                m.scale.y = cs * 0.9
-                m.scale.z = max(0.05, fire_h)
-
-                r = 1.0
-                g = max(0.0, 0.6 * (1.0 - val))
-                m.color = _rgba(r, g, 0.0, 0.65 + 0.30 * val)
-
-                ma.markers.append(m)
-
-        # Also update tree canopy colors to show burning trees
-        self._publish_burning_trees(msg, stamp, ma)
-
-        self._pub_fire.publish(ma)
-
-    def _publish_burning_trees(self, msg: FireGrid, stamp, ma: MarkerArray):
-        """Tint tree canopies in burning cells orange/black."""
-        n = msg.width
-        cs = msg.cell_size
-        half = n * cs / 2.0
-
+        # burning tree canopies
         for i, (wx, wy, gz) in enumerate(self._tree_positions):
             gx = int((wx + half) / cs)
             gy = int((wy + half) / cs)
@@ -471,139 +378,81 @@ class ScenePublisher3D(Node):
             val = msg.intensity[gy * n + gx]
             if val < 0.05:
                 continue
+            trunk_h, canopy_r = self._tree_data[i]
+            burn_spheres.append(fgs.SpherePrimitive(
+                pose=_fg_pose(wx, wy, gz + trunk_h + canopy_r * 0.6),
+                size=_fg_vec3(canopy_r * 2.2, canopy_r * 2.2, canopy_r * 1.8),
+                color=_fg_color(0.9 * val + 0.1, 0.3 * (1.0 - val), 0.0, 0.8),
+            ))
 
-            m = Marker()
-            m.header.stamp = stamp
-            m.header.frame_id = 'world'
-            m.ns = 'tree_canopy_burn'
-            m.id = i
-            m.type = Marker.SPHERE
-            m.action = Marker.ADD
-            m.lifetime = _duration(sec=2)
-            m.pose.position.x = wx
-            m.pose.position.y = wy
-            m.pose.position.z = gz + 2.0
-            m.pose.orientation.w = 1.0
-            m.scale.x = 1.2
-            m.scale.y = 1.2
-            m.scale.z = 1.0
-            r = 0.9 * val + 0.1
-            g = 0.3 * (1.0 - val)
-            m.color = _rgba(r, g, 0.0, 0.8)
-            ma.markers.append(m)
+        fire_entity = fgs.SceneEntity(
+            timestamp=ts, frame_id=FRAME_ID, id='fire',
+            lifetime=fgs.Duration(sec=2, nsec=0),
+            cubes=fire_cubes, spheres=burn_spheres,
+        )
+        foxglove.log('/scene', fgs.SceneUpdate(entities=[fire_entity]))
 
     # -----------------------------------------------------------------------
     # Robot markers (5 Hz)
     # -----------------------------------------------------------------------
 
     def _publish_robots(self):
-        ma = MarkerArray()
-        stamp = self.get_clock().now().to_msg()
-        mid = 0
+        ts = _fg_ts()
+
+        cubes = []
+        cylinders = []
+        texts = []
 
         # water supply
-        m = Marker()
-        m.header.stamp = stamp
-        m.header.frame_id = 'world'
-        m.ns = 'water_supply'
-        m.id = 0
-        m.type = Marker.CYLINDER
-        m.action = Marker.ADD
-        m.lifetime = _duration(sec=1)
-        m.pose.position.x = 0.0
-        m.pose.position.y = 0.0
-        m.pose.position.z = 0.5
-        m.pose.orientation.w = 1.0
-        m.scale.x = 1.0
-        m.scale.y = 1.0
-        m.scale.z = 1.0
-        m.color = _rgba(0.2, 0.5, 0.9, 0.85)
-        ma.markers.append(m)
+        cylinders.append(fgs.CylinderPrimitive(
+            pose=_fg_pose(0.0, 0.0, 0.5),
+            size=_fg_vec3(1.0, 1.0, 1.0),
+            color=_fg_color(0.2, 0.5, 0.9, 0.85),
+        ))
+        texts.append(fgs.TextPrimitive(
+            pose=_fg_pose(0.0, 0.0, 1.3),
+            billboard=True, font_size=14.0, scale_invariant=True,
+            color=_fg_color(0.5, 0.8, 1.0),
+            text='WATER',
+        ))
 
         # firefighters
         for fid, (fx, fy, fz) in self._ff_pos.items():
-            # body cube
-            m = Marker()
-            m.header.stamp = stamp
-            m.header.frame_id = 'world'
-            m.ns = 'ff_body'
-            m.id = mid
-            m.type = Marker.CUBE
-            m.action = Marker.ADD
-            m.lifetime = _duration(sec=1)
-            m.pose.position.x = fx
-            m.pose.position.y = fy
-            m.pose.position.z = fz + 0.25
-            m.pose.orientation.w = 1.0
-            m.scale.x = 0.6
-            m.scale.y = 0.5
-            m.scale.z = 0.3
             water_pct = self._ff_water.get(fid, 100.0)
-            if water_pct > 20:
-                m.color = _rgba(1.0, 0.85, 0.0)
-            else:
-                m.color = _rgba(1.0, 0.4, 0.1)
-            ma.markers.append(m)
-
-            # label
-            mt = Marker()
-            mt.header.stamp = stamp
-            mt.header.frame_id = 'world'
-            mt.ns = 'ff_label'
-            mt.id = mid
-            mt.type = Marker.TEXT_VIEW_FACING
-            mt.action = Marker.ADD
-            mt.lifetime = _duration(sec=1)
-            mt.pose.position.x = fx
-            mt.pose.position.y = fy
-            mt.pose.position.z = fz + 0.8
-            mt.pose.orientation.w = 1.0
-            mt.scale.z = 0.3
-            mt.color = _rgba(1.0, 1.0, 1.0)
-            mt.text = f'{fid} ({water_pct:.0f}%)'
-            ma.markers.append(mt)
-
-            mid += 1
+            color = _fg_color(1.0, 0.85, 0.0) if water_pct > 20 else _fg_color(1.0, 0.4, 0.1)
+            cubes.append(fgs.CubePrimitive(
+                pose=_fg_pose(fx, fy, fz + 0.25),
+                size=_fg_vec3(0.6, 0.5, 0.3),
+                color=color,
+            ))
+            texts.append(fgs.TextPrimitive(
+                pose=_fg_pose(fx, fy, fz + 0.8),
+                billboard=True, font_size=12.0, scale_invariant=True,
+                color=_fg_color(1.0, 1.0, 1.0),
+                text=f'{fid} ({water_pct:.0f}%)',
+            ))
 
         # scout drone
         sx, sy, sz = self._scout_pos
-        m = Marker()
-        m.header.stamp = stamp
-        m.header.frame_id = 'world'
-        m.ns = 'scout'
-        m.id = 0
-        m.type = Marker.CUBE
-        m.action = Marker.ADD
-        m.lifetime = _duration(sec=1)
-        m.pose.position.x = sx
-        m.pose.position.y = sy
-        m.pose.position.z = max(sz, 5.0)
-        m.pose.orientation.w = 1.0
-        m.scale.x = 0.4
-        m.scale.y = 0.4
-        m.scale.z = 0.1
-        m.color = _rgba(0.2, 0.5, 1.0)
-        ma.markers.append(m)
+        sz = max(sz, 5.0)
+        cubes.append(fgs.CubePrimitive(
+            pose=_fg_pose(sx, sy, sz),
+            size=_fg_vec3(0.4, 0.4, 0.1),
+            color=_fg_color(0.2, 0.5, 1.0),
+        ))
+        texts.append(fgs.TextPrimitive(
+            pose=_fg_pose(sx, sy, sz + 0.5),
+            billboard=True, font_size=12.0, scale_invariant=True,
+            color=_fg_color(0.8, 0.9, 1.0),
+            text='Scout Drone',
+        ))
 
-        # scout label
-        mt = Marker()
-        mt.header.stamp = stamp
-        mt.header.frame_id = 'world'
-        mt.ns = 'scout_label'
-        mt.id = 0
-        mt.type = Marker.TEXT_VIEW_FACING
-        mt.action = Marker.ADD
-        mt.lifetime = _duration(sec=1)
-        mt.pose.position.x = sx
-        mt.pose.position.y = sy
-        mt.pose.position.z = max(sz, 5.0) + 0.5
-        mt.pose.orientation.w = 1.0
-        mt.scale.z = 0.3
-        mt.color = _rgba(0.8, 0.9, 1.0)
-        mt.text = 'Scout Drone'
-        ma.markers.append(mt)
-
-        self._pub_robots.publish(ma)
+        robot_entity = fgs.SceneEntity(
+            timestamp=ts, frame_id=FRAME_ID, id='robots',
+            lifetime=fgs.Duration(sec=1, nsec=0),
+            cubes=cubes, cylinders=cylinders, texts=texts,
+        )
+        foxglove.log('/scene', fgs.SceneUpdate(entities=[robot_entity]))
 
 
 def main(args=None):

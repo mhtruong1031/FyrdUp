@@ -23,13 +23,15 @@ class FireGridNode(Node):
     def __init__(self):
         super().__init__('fire_grid_node')
 
-        self.declare_parameter('grid_size', 20)
+        self.declare_parameter('grid_size', 50)
         self.declare_parameter('cell_size', 1.0)
         self.declare_parameter('base_spread_prob', 0.05)
         self.declare_parameter('wind_factor', 2.0)
         self.declare_parameter('wind_direction', 45.0)
         self.declare_parameter('update_rate', 1.0)
         self.declare_parameter('initial_fire_radius', 2)
+        self.declare_parameter('fire_start_x', 0.0)
+        self.declare_parameter('fire_start_y', 12.0)
 
         self.grid_size = self.get_parameter('grid_size').value
         self.cell_size = self.get_parameter('cell_size').value
@@ -38,19 +40,23 @@ class FireGridNode(Node):
         self.wind_direction = self.get_parameter('wind_direction').value
         self.update_rate = self.get_parameter('update_rate').value
         self.initial_fire_radius = self.get_parameter('initial_fire_radius').value
+        fire_start_x = self.get_parameter('fire_start_x').value
+        fire_start_y = self.get_parameter('fire_start_y').value
 
         n = self.grid_size
         self.fire_intensity = [0.0] * (n * n)
 
-        # Seed a circular blob of fire at the grid centre
-        center = n // 2
+        cx = int(fire_start_x / self.cell_size + n / 2.0)
+        cy = int(fire_start_y / self.cell_size + n / 2.0)
         r = self.initial_fire_radius
         for dy in range(-r, r + 1):
             for dx in range(-r, r + 1):
                 if dx * dx + dy * dy <= r * r:
-                    x, y = center + dx, center + dy
+                    x, y = cx + dx, cy + dy
                     if 0 <= x < n and 0 <= y < n:
                         self.fire_intensity[y * n + x] = 1.0
+
+        self._tick_count = 0
 
         self.fire_grid_pub = self.create_publisher(FireGrid, '/fire_grid', 10)
         self.create_subscription(Point, '/water_spray', self._water_spray_cb, 10)
@@ -58,20 +64,35 @@ class FireGridNode(Node):
         period = 1.0 / max(self.update_rate, 0.01)
         self.create_timer(period, self._tick)
 
+        initial_burning = sum(1 for v in self.fire_intensity if v > 0.1)
         self.get_logger().info(
-            f'FireGridNode started: {n}x{n} grid, wind {self.wind_direction}°, '
-            f'update {self.update_rate} Hz, blob radius {self.initial_fire_radius}')
+            f'[FIRE] Started: {n}x{n} grid, wind {self.wind_direction}°, '
+            f'update {self.update_rate} Hz, blob radius {self.initial_fire_radius}, '
+            f'initial_burning={initial_burning} cells')
 
     # -- callbacks -----------------------------------------------------------
 
     def _tick(self):
+        self._tick_count += 1
         self._spread_fire()
         self._publish()
+
+        if self._tick_count % 10 == 0:
+            n = self.grid_size
+            burning = sum(1 for v in self.fire_intensity if v > 0.1)
+            max_int = max(self.fire_intensity) if self.fire_intensity else 0.0
+            self.get_logger().info(
+                f'[FIRE] tick={self._tick_count} '
+                f'burning={burning}/{n*n} '
+                f'max_intensity={max_int:.2f}')
 
     def _water_spray_cb(self, msg: Point):
         n = self.grid_size
         gx = int((msg.x + n * self.cell_size / 2.0) / self.cell_size)
         gy = int((msg.y + n * self.cell_size / 2.0) / self.cell_size)
+        self.get_logger().info(
+            f'[FIRE] Water spray at world=({msg.x:.1f}, {msg.y:.1f}) '
+            f'grid=({gx}, {gy})')
         for dy in range(-1, 2):
             for dx in range(-1, 2):
                 self._extinguish(gx + dx, gy + dy, 0.3)

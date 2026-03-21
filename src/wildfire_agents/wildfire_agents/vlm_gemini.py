@@ -71,13 +71,16 @@ class GeminiVLM(VLMInterface):
 
     async def analyze_fire(self, image: np.ndarray) -> Dict:
         try:
+            print(f'[VLM] Encoding image shape={image.shape} dtype={image.dtype}')
             jpeg_bytes = self._encode_image(image)
+            print(f'[VLM] JPEG encoded: {len(jpeg_bytes)} bytes')
 
             image_part = {
                 'mime_type': 'image/jpeg',
                 'data': jpeg_bytes,
             }
 
+            print('[VLM] Calling Gemini API...')
             response = await asyncio.to_thread(
                 self.model.generate_content,
                 [TACTICAL_PROMPT, image_part],
@@ -89,6 +92,9 @@ class GeminiVLM(VLMInterface):
             )
 
             text = response.text.strip()
+            print(f'[VLM] Raw response ({len(text)} chars): '
+                  f'{text[:300]}{"..." if len(text) > 300 else ""}')
+
             if text.startswith('```'):
                 text = text.split('\n', 1)[1]
                 if text.endswith('```'):
@@ -98,13 +104,25 @@ class GeminiVLM(VLMInterface):
             result = json.loads(text)
 
             if self._validate_response(result):
+                n_fires = len(result.get('fire_locations', []))
+                n_recs = len(result.get('recommended_positions', []))
+                print(f'[VLM] Valid response: '
+                      f'fires={n_fires} recommended={n_recs} '
+                      f'threat={result.get("threat_level", "?")} '
+                      f'wind={result.get("wind_direction", "?")}° '
+                      f'| {result.get("analysis", "")[:120]}')
                 return result
 
-            print('Warning: Invalid VLM response, using defaults')
+            print(f'[VLM] WARNING: Invalid response (missing fields). '
+                  f'Keys present: {list(result.keys())}. Using defaults.')
             return self._create_default_response()
 
+        except json.JSONDecodeError as e:
+            print(f'[VLM] ERROR: JSON parse failed: {e}')
+            print(f'[VLM] Raw text was: {text[:200] if "text" in dir() else "N/A"}')
+            return self._create_default_response()
         except Exception as e:
-            print(f'Error in Gemini VLM analysis: {e}')
+            print(f'[VLM] ERROR: Gemini VLM analysis failed: {e}')
             return self._create_default_response()
 
     def _encode_image(self, image: np.ndarray) -> bytes:
