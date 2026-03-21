@@ -4,8 +4,7 @@
 
 Subscribes to /fire_grid and robot odometry, publishes 3D scene updates
 via the foxglove-sdk (SceneUpdate) so Foxglove's 3D panel can render
-procedural terrain, trees, rocks, fire, and robots — no foxglove_bridge
-ROS package required.
+terrain (from Depth Anything), trees, rocks, fire, and robots.
 
 Connects to the foxglove server started by foxglove_viz on port 8766.
 """
@@ -25,50 +24,6 @@ from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32
 from wildfire_msgs.msg import FireGrid
-
-
-# ---------------------------------------------------------------------------
-# Simple value-noise (no external deps) for terrain height
-# ---------------------------------------------------------------------------
-
-_PERM = list(range(256))
-_random.Random(42).shuffle(_PERM)
-_PERM *= 2
-
-
-def _fade(t):
-    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
-
-
-def _lerp(a, b, t):
-    return a + t * (b - a)
-
-
-def _value_noise_2d(x, y):
-    xi = int(math.floor(x)) & 255
-    yi = int(math.floor(y)) & 255
-    xf = x - math.floor(x)
-    yf = y - math.floor(y)
-    u = _fade(xf)
-    v = _fade(yf)
-    aa = _PERM[_PERM[xi] + yi]
-    ab = _PERM[_PERM[xi] + yi + 1]
-    ba = _PERM[_PERM[xi + 1] + yi]
-    bb = _PERM[_PERM[xi + 1] + yi + 1]
-    x1 = _lerp(aa / 255.0, ba / 255.0, u)
-    x2 = _lerp(ab / 255.0, bb / 255.0, u)
-    return _lerp(x1, x2, v)
-
-
-def _fbm(x, y, octaves=4, lacunarity=2.0, gain=0.5):
-    val = 0.0
-    amp = 1.0
-    freq = 1.0
-    for _ in range(octaves):
-        val += amp * _value_noise_2d(x * freq, y * freq)
-        amp *= gain
-        freq *= lacunarity
-    return val
 
 
 # ---------------------------------------------------------------------------
@@ -99,8 +54,7 @@ def _fg_ts():
 # Constants
 # ---------------------------------------------------------------------------
 
-TERRAIN_NOISE_SCALE = 0.25
-TERRAIN_HEIGHT_AMP = 0.6
+TERRAIN_HEIGHT_AMP = 2.0
 TREE_COUNT = 100
 TREE_SEED = 12345
 ROCK_COUNT = 30
@@ -167,15 +121,20 @@ class ScenePublisher3D(Node):
     # -----------------------------------------------------------------------
 
     def _build_terrain_heights(self):
+        """Load terrain from Depth Anything heightmap (falls back to flat)."""
         n = self._grid_size
-        cs = self._cell_size
-        h = np.zeros((n, n), dtype=np.float64)
-        for gy in range(n):
-            for gx in range(n):
-                wx = (gx - n / 2.0 + 0.5) * cs
-                wy = (gy - n / 2.0 + 0.5) * cs
-                h[gy, gx] = _fbm(wx * TERRAIN_NOISE_SCALE, wy * TERRAIN_NOISE_SCALE) * TERRAIN_HEIGHT_AMP
-        return h
+        try:
+            from .world_init import compute_heightmap, default_image_path
+            image_path = os.environ.get('WILDFIRE_IMAGE_PATH') or default_image_path()
+            h = compute_heightmap(image_path, n)
+            self.get_logger().info(
+                f'[SCENE] Terrain loaded from Depth Anything: '
+                f'range=[{h.min():.2f}, {h.max():.2f}]')
+            return h
+        except Exception as exc:
+            self.get_logger().warning(
+                f'[SCENE] Depth Anything failed ({exc}); using flat terrain')
+            return np.zeros((n, n), dtype=np.float64)
 
     def _build_terrain_entity(self):
         n = self._grid_size
@@ -324,6 +283,17 @@ class ScenePublisher3D(Node):
     # Callbacks
     # -----------------------------------------------------------------------
 
+    def _terrain_z(self, wx: float, wy: float) -> float:
+        """Look up terrain height at world coordinates."""
+        n = self._grid_size
+        cs = self._cell_size
+        half = self._half_world
+        gx = int((wx + half) / cs)
+        gy = int((wy + half) / cs)
+        if 0 <= gx < n and 0 <= gy < n:
+            return float(self._terrain_h[gy, gx])
+        return 0.0
+
     def _odom_cb(self, fid, msg):
         p = msg.pose.pose.position
         self._ff_pos[fid] = (p.x, p.y, p.z)
@@ -416,17 +386,19 @@ class ScenePublisher3D(Node):
             text='WATER',
         ))
 
-        # firefighters
-        for fid, (fx, fy, fz) in self._ff_pos.items():
+        # firefighters — tall rectangular blocks (0.4 x 0.4 x 0.8) on terrain
+        ff_w, ff_d, ff_h = 0.4, 0.4, 0.8
+        for fid, (fx, fy, _fz) in self._ff_pos.items():
+            gz = self._terrain_z(fx, fy)
             water_pct = self._ff_water.get(fid, 100.0)
             color = _fg_color(1.0, 0.85, 0.0) if water_pct > 20 else _fg_color(1.0, 0.4, 0.1)
             cubes.append(fgs.CubePrimitive(
-                pose=_fg_pose(fx, fy, fz + 0.25),
-                size=_fg_vec3(0.6, 0.5, 0.3),
+                pose=_fg_pose(fx, fy, gz + ff_h / 2.0),
+                size=_fg_vec3(ff_w, ff_d, ff_h),
                 color=color,
             ))
             texts.append(fgs.TextPrimitive(
-                pose=_fg_pose(fx, fy, fz + 0.8),
+                pose=_fg_pose(fx, fy, gz + ff_h + 0.3),
                 billboard=True, font_size=12.0, scale_invariant=True,
                 color=_fg_color(1.0, 1.0, 1.0),
                 text=f'{fid} ({water_pct:.0f}%)',

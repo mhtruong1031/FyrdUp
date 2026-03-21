@@ -57,7 +57,7 @@ fire_intensity array length must match fire_locations length.
 class GeminiVLM(VLMInterface):
     """Gemini 2.0 Flash implementation of the VLM interface."""
 
-    def __init__(self, api_key: str = None, model_name: str = 'gemini-2.0-flash'):
+    def __init__(self, api_key: str = None, model_name: str = 'gemini-2.5-flash'):
         if api_key is None:
             api_key = os.environ.get('GOOGLE_API_KEY')
             if not api_key:

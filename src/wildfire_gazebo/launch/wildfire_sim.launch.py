@@ -64,12 +64,30 @@ def generate_launch_description():
         'headless', default_value=headless_default,
         description='Run Gazebo in server-only mode (no GUI)')
 
+    # Default image_path: wildfire.png in the workspace root
+    # Try env var first (set by caller), then probe common locations
+    _default_img = os.environ.get('WILDFIRE_IMAGE_PATH', '')
+    if not _default_img or not os.path.isfile(_default_img):
+        for _candidate in [
+            os.path.join(os.getcwd(), 'wildfire.png'),
+            '/Users/minhtruong/Documents/BeachHacks2026/wildfire.png',
+        ]:
+            if os.path.isfile(_candidate):
+                _default_img = _candidate
+                break
+    image_path_arg = DeclareLaunchArgument(
+        'image_path',
+        default_value=_default_img,
+        description='Path to aerial wildfire image for Depth Anything + Gemini fire init')
+
     # -- environment for ros_bridge ------------------------------------------
 
     set_num_ff = SetEnvironmentVariable(
         'NUM_FIREFIGHTERS', LaunchConfiguration('num_firefighters'))
     set_use_vlm = SetEnvironmentVariable(
         'USE_VLM', LaunchConfiguration('use_vlm'))
+    set_image_path = SetEnvironmentVariable(
+        'WILDFIRE_IMAGE_PATH', LaunchConfiguration('image_path'))
 
     # -- Gazebo Harmonic (server-only on macOS) ------------------------------
 
@@ -147,8 +165,10 @@ def generate_launch_description():
     ld.add_action(num_ff_arg)
     ld.add_action(use_vlm_arg)
     ld.add_action(headless_arg)
+    ld.add_action(image_path_arg)
     ld.add_action(set_num_ff)
     ld.add_action(set_use_vlm)
+    ld.add_action(set_image_path)
 
     ld.add_action(gazebo)
     ld.add_action(sim_odom)

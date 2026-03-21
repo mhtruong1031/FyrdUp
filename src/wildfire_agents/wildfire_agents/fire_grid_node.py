@@ -2,20 +2,28 @@
 """
 ROS 2 node that simulates fire spread on a grid.
 
-Replaces a Gazebo-Classic world plugin with a pure-ROS node so it works with
-Gazebo Harmonic (gz sim) or entirely headless.
+At startup the fire shape is detected from wildfire.png via Gemini VLM and
+placed as a 12×12 block in the top half of the 50×50 grid.  The Depth
+Anything heightmap is also loaded so terrain slope can influence spread.
 
 Publishes:  /fire_grid   (wildfire_msgs/msg/FireGrid)
 Subscribes: /water_spray  (geometry_msgs/msg/Point)
 """
 
 import math
+import os
 import random
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Point
 from wildfire_msgs.msg import FireGrid
+
+# 12×12 fire block placement in the 50×50 grid (top-half, centred on x)
+_FIRE_BLOCK_SIZE = 12
+_FIRE_BLOCK_ORIGIN_X = 19   # grid column offset  (19 .. 30)
+_FIRE_BLOCK_ORIGIN_Y = 31   # grid row offset      (31 .. 42)  → world y ≈ 6..17
 
 
 class FireGridNode(Node):
@@ -41,22 +49,13 @@ class FireGridNode(Node):
         self.wind_direction = self.get_parameter('wind_direction').value
         self.update_rate = self.get_parameter('update_rate').value
         self.initial_fire_radius = self.get_parameter('initial_fire_radius').value
-        fire_start_x = self.get_parameter('fire_start_x').value
-        fire_start_y = self.get_parameter('fire_start_y').value
         self.spray_range = self.get_parameter('spray_range').value
 
         n = self.grid_size
         self.fire_intensity = [0.0] * (n * n)
+        self.heightmap: np.ndarray | None = None
 
-        cx = int(fire_start_x / self.cell_size + n / 2.0)
-        cy = int(fire_start_y / self.cell_size + n / 2.0)
-        r = self.initial_fire_radius
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                if dx * dx + dy * dy <= r * r:
-                    x, y = cx + dx, cy + dy
-                    if 0 <= x < n and 0 <= y < n:
-                        self.fire_intensity[y * n + x] = 1.0
+        self._init_from_image(n)
 
         self._tick_count = 0
 
@@ -69,8 +68,44 @@ class FireGridNode(Node):
         initial_burning = sum(1 for v in self.fire_intensity if v > 0.1)
         self.get_logger().info(
             f'[FIRE] Started: {n}x{n} grid, wind {self.wind_direction}°, '
-            f'update {self.update_rate} Hz, blob radius {self.initial_fire_radius}, '
-            f'initial_burning={initial_burning} cells')
+            f'update {self.update_rate} Hz, '
+            f'initial_burning={initial_burning} cells (from Gemini VLM)')
+
+    # -- image-based initialisation ------------------------------------------
+
+    def _init_from_image(self, n: int):
+        """Detect fire shape with Gemini VLM and load Depth Anything heightmap."""
+        try:
+            from .world_init import detect_fire_shape, compute_heightmap, default_image_path
+            image_path = os.environ.get('WILDFIRE_IMAGE_PATH') or default_image_path()
+
+            fire_cells = detect_fire_shape(image_path)
+            for local_x, local_y in fire_cells:
+                gx = _FIRE_BLOCK_ORIGIN_X + local_x
+                gy = _FIRE_BLOCK_ORIGIN_Y + local_y
+                if 0 <= gx < n and 0 <= gy < n:
+                    self.fire_intensity[gy * n + gx] = 1.0
+
+            self.heightmap = compute_heightmap(image_path, n)
+            self.get_logger().info(
+                f'[FIRE] Loaded heightmap and {len(fire_cells)} fire cells from VLM')
+        except Exception as exc:
+            self.get_logger().warning(
+                f'[FIRE] Image init failed ({exc}); falling back to circular blob')
+            self._fallback_circle_init(n)
+
+    def _fallback_circle_init(self, n: int):
+        fire_start_x = self.get_parameter('fire_start_x').value
+        fire_start_y = self.get_parameter('fire_start_y').value
+        cx = int(fire_start_x / self.cell_size + n / 2.0)
+        cy = int(fire_start_y / self.cell_size + n / 2.0)
+        r = self.initial_fire_radius
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if dx * dx + dy * dy <= r * r:
+                    x, y = cx + dx, cy + dy
+                    if 0 <= x < n and 0 <= y < n:
+                        self.fire_intensity[y * n + x] = 1.0
 
     # -- callbacks -----------------------------------------------------------
 
@@ -115,8 +150,6 @@ class FireGridNode(Node):
         dy = [0, 0, -1, 1]
         angles = [180.0, 0.0, 270.0, 90.0]
 
-        wind_rad = math.radians(self.wind_direction)
-
         for y in range(n):
             for x in range(n):
                 idx = y * n + x
@@ -138,6 +171,12 @@ class FireGridNode(Node):
                         prob *= self.wind_factor      # downwind boost
                     elif angle_diff > 135.0:
                         prob *= 0.5                    # upwind penalty
+
+                    # Uphill spread boost from Depth Anything heightmap
+                    if self.heightmap is not None:
+                        dh = float(self.heightmap[ny_, nx_] - self.heightmap[y, x])
+                        if dh > 0:
+                            prob *= 1.0 + dh * 2.0    # fire climbs faster
 
                     if random.random() < prob:
                         new[nidx] = min(1.0, self.fire_intensity[idx] * 0.8)
