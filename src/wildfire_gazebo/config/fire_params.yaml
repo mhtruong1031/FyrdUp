@@ -1,0 +1,9 @@
+fire_grid_node:
+  ros__parameters:
+    grid_size: 20
+    cell_size: 1.0
+    base_spread_prob: 0.05
+    wind_factor: 2.0
+    wind_direction: 45.0
+    update_rate: 1.0
+    initial_fire_radius: 2

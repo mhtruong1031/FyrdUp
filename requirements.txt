@@ -1,0 +1,8 @@
+uagents==0.11.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+google-generativeai>=0.8.0
+rich>=13.7.0
+cv-bridge
+nest_asyncio
+pyyaml>=6.0

@@ -1,0 +1,5 @@
+scout_position_controller:
+  ros__parameters:
+    survey_altitude: 15.0
+    kp_xy: 0.5
+    kp_z: 0.8
