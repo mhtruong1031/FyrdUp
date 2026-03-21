@@ -122,6 +122,39 @@ def generate_launch_description():
         output='screen',
     )
 
+    # -- 3D scene publisher for Foxglove Studio ------------------------------
+
+    scene_publisher_3d = Node(
+        package='wildfire_agents',
+        executable='scene_publisher_3d',
+        name='scene_publisher_3d',
+        output='screen',
+    )
+
+    # -- Foxglove Bridge (WebSocket on port 8765) ----------------------------
+
+    foxglove_bridge = Node(
+        package='foxglove_bridge',
+        executable='foxglove_bridge',
+        name='foxglove_bridge',
+        parameters=[{
+            'port': 8765,
+            'address': '0.0.0.0',
+            'send_buffer_limit': 10000000,
+        }],
+        output='screen',
+    )
+
+    # -- Static TF: world -> map identity ------------------------------------
+
+    static_tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='static_tf_world_map',
+        arguments=['0', '0', '0', '0', '0', '0', 'world', 'map'],
+        output='screen',
+    )
+
     # -- assemble ------------------------------------------------------------
 
     ld = LaunchDescription()
@@ -138,5 +171,8 @@ def generate_launch_description():
     ld.add_action(OpaqueFunction(function=_spawn_firefighters))
     ld.add_action(viz_renderer)
     ld.add_action(ros_bridge)
+    ld.add_action(scene_publisher_3d)
+    ld.add_action(foxglove_bridge)
+    ld.add_action(static_tf)
 
     return ld

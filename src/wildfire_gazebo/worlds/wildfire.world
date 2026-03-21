@@ -91,6 +91,152 @@
       </link>
     </model>
 
+    <!-- Rocks and boulders scattered across the terrain -->
+
+    <model name="boulder_1">
+      <pose>-7.2 3.5 0.2 0 0 0.4</pose>
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><sphere><radius>0.4</radius></sphere></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><sphere><radius>0.4</radius></sphere></geometry>
+          <material>
+            <ambient>0.45 0.42 0.38 1</ambient>
+            <diffuse>0.45 0.42 0.38 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="boulder_2">
+      <pose>5.8 -6.1 0.25 0.1 0 1.2</pose>
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.7 0.5 0.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.7 0.5 0.5</size></box></geometry>
+          <material>
+            <ambient>0.50 0.46 0.40 1</ambient>
+            <diffuse>0.50 0.46 0.40 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="boulder_3">
+      <pose>-3.0 -8.0 0.15 0 0.15 2.1</pose>
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><sphere><radius>0.3</radius></sphere></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><sphere><radius>0.3</radius></sphere></geometry>
+          <material>
+            <ambient>0.40 0.38 0.35 1</ambient>
+            <diffuse>0.40 0.38 0.35 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="boulder_4">
+      <pose>8.1 7.3 0.3 0 0 0.8</pose>
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.6 0.8 0.6</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.6 0.8 0.6</size></box></geometry>
+          <material>
+            <ambient>0.48 0.44 0.39 1</ambient>
+            <diffuse>0.48 0.44 0.39 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Tree stumps / logs -->
+
+    <model name="log_1">
+      <pose>-5.5 6.2 0.1 1.57 0 0.6</pose>
+      <static>true</static>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <cylinder>
+              <radius>0.12</radius>
+              <length>1.5</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.35 0.22 0.10 1</ambient>
+            <diffuse>0.35 0.22 0.10 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="log_2">
+      <pose>6.3 -2.8 0.1 1.57 0 2.3</pose>
+      <static>true</static>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <cylinder>
+              <radius>0.10</radius>
+              <length>1.2</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.30 0.20 0.08 1</ambient>
+            <diffuse>0.30 0.20 0.08 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Small raised terrain mound (box approximation) -->
+
+    <model name="mound_1">
+      <pose>-2.0 5.0 0.1 0 0 0</pose>
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>3.0 2.5 0.2</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>3.0 2.5 0.2</size></box></geometry>
+          <material>
+            <ambient>0.32 0.45 0.22 1</ambient>
+            <diffuse>0.32 0.45 0.22 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="mound_2">
+      <pose>4.5 -5.5 0.08 0 0 0.5</pose>
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>2.0 3.0 0.16</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>2.0 3.0 0.16</size></box></geometry>
+          <material>
+            <ambient>0.35 0.48 0.24 1</ambient>
+            <diffuse>0.35 0.48 0.24 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
     <!-- Fire logic handled by fire_grid_node (ROS 2 node), not a Gazebo plugin -->
 
   </world>
