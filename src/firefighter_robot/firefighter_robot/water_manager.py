@@ -20,7 +20,7 @@ class WaterManager(Node):
         self.declare_parameter('tank_capacity', 100.0)
         self.declare_parameter('spray_rate', 5.0)
         self.declare_parameter('refill_rate', 20.0)
-        self.declare_parameter('spray_radius', 1.5)
+        self.declare_parameter('spray_radius', 3.0)
         self.declare_parameter('refill_radius', 2.0)
 
         self.tank_capacity = self.get_parameter('tank_capacity').value

@@ -32,6 +32,7 @@ class FireGridNode(Node):
         self.declare_parameter('initial_fire_radius', 2)
         self.declare_parameter('fire_start_x', 0.0)
         self.declare_parameter('fire_start_y', 12.0)
+        self.declare_parameter('spray_range', 3)
 
         self.grid_size = self.get_parameter('grid_size').value
         self.cell_size = self.get_parameter('cell_size').value
@@ -42,6 +43,7 @@ class FireGridNode(Node):
         self.initial_fire_radius = self.get_parameter('initial_fire_radius').value
         fire_start_x = self.get_parameter('fire_start_x').value
         fire_start_y = self.get_parameter('fire_start_y').value
+        self.spray_range = self.get_parameter('spray_range').value
 
         n = self.grid_size
         self.fire_intensity = [0.0] * (n * n)
@@ -90,12 +92,17 @@ class FireGridNode(Node):
         n = self.grid_size
         gx = int((msg.x + n * self.cell_size / 2.0) / self.cell_size)
         gy = int((msg.y + n * self.cell_size / 2.0) / self.cell_size)
+        r = self.spray_range
         self.get_logger().info(
             f'[FIRE] Water spray at world=({msg.x:.1f}, {msg.y:.1f}) '
-            f'grid=({gx}, {gy})')
-        for dy in range(-1, 2):
-            for dx in range(-1, 2):
-                self._extinguish(gx + dx, gy + dy, 0.3)
+            f'grid=({gx}, {gy}) range={r}')
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                dist_sq = dx * dx + dy * dy
+                if dist_sq > r * r:
+                    continue
+                falloff = 1.0 - math.sqrt(dist_sq) / (r + 1)
+                self._extinguish(gx + dx, gy + dy, 0.3 * falloff)
 
     # -- fire spread ---------------------------------------------------------
 

@@ -30,6 +30,7 @@ setup(
             'viz_renderer = wildfire_agents.viz_renderer:main',
             'foxglove_viz = wildfire_agents.foxglove_viz:main',
             'scene_publisher_3d = wildfire_agents.scene_publisher_3d:main',
+            'sim_odom_node = wildfire_agents.sim_odom_node:main',
         ],
     },
 )

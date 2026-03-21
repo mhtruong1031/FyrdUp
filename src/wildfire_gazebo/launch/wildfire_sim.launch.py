@@ -122,6 +122,15 @@ def generate_launch_description():
         output='screen',
     )
 
+    # -- Simulated odometry (dead-reckoning from cmd_vel) -------------------
+
+    sim_odom = Node(
+        package='wildfire_agents',
+        executable='sim_odom_node',
+        name='sim_odom_node',
+        output='screen',
+    )
+
     # -- ROS-uAgent bridge ---------------------------------------------------
 
     ros_bridge = Node(
@@ -142,6 +151,7 @@ def generate_launch_description():
     ld.add_action(set_use_vlm)
 
     ld.add_action(gazebo)
+    ld.add_action(sim_odom)
     ld.add_action(scout_controller)
     ld.add_action(fire_grid)
     ld.add_action(OpaqueFunction(function=_spawn_firefighters))
