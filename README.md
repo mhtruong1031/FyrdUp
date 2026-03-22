@@ -1,224 +1,241 @@
-# Wildfire Simulation — Gazebo + Fetch uAgents + Gemini VLM
+# Wildfire — uAgents, Google ADK & Gemini, ROS 2 & Gazebo Harmonic
 
-A multi-agent wildfire fighting simulation built on ROS 2 Humble, Gazebo Harmonic,
-and the Fetch uAgent SDK. A scout drone uses Google Gemini (VLM) to analyse the
-fire from above and coordinates N firefighter ground robots in real time.
+Multi-agent wildfire simulation for **BeachHacks 2026**: a **scout** coordinates **N firefighter** ground robots using **Fetch uAgents**, a **Google ADK** scout agent, and **Gemini** for vision-driven fire initialization and tactical assignment. Physics and terrain run in **Gazebo Harmonic**; fire spread is simulated on a ROS 2 grid and visualized in **Foxglove Studio** via embedded **foxglove-sdk** WebSocket servers.
 
-Gazebo Harmonic runs headlessly (server-only, no GUI) with visualization handled
-by **Foxglove Studio** over a WebSocket bridge. A dedicated 3D scene publisher
-generates procedural terrain, trees, rocks, fire volumes, and robot markers so
-the full simulation is visible in Foxglove's 3D panel.
+![Reference aerial image used for terrain & fire initialization](wildfire.png)
+
+## Overview
+
+| Layer | Role |
+|-------|------|
+| **Gazebo Harmonic** | Headless world (`gz sim -s -r`), local install on the host |
+| **ROS 2 Humble** | Topics for grid, odometry, cmd_vel, water, bridge |
+| **Fetch uAgents** | Scout + firefighter messaging (`MoveCommand`, `RefillCommand`, alerts) |
+| **Google ADK + Gemini** | `ScoutADKAgent`: deterministic fast-path + JSON assignments from Gemini when needed |
+| **VLM + depth** | Gemini labels fire shape from `wildfire.png`; **Depth Anything V2** builds a heightmap (PyTorch) |
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│            Gazebo Harmonic (headless, local)             │
-│   20×20 m procedural terrain + boulders + water supply  │
-└─────────────────────────────────────────────────────────┘
-                          │
-                   ROS 2 Humble topics
-                          │
-    ┌─────────────────────┼─────────────────────┐
-    │                     │                     │
-fire_grid_node      scout_robot       firefighter_robot (×N)
-  /fire_grid        /scout/*          /firefighter_*/cmd_vel
-  /water_spray                        /firefighter_*/water_level
-    │                     │                     │
-    └─────────────────────┼─────────────────────┘
-                          │
-                scene_publisher_3d
-          /viz/terrain_markers   (MarkerArray)
-          /viz/tree_markers      (MarkerArray)
-          /viz/rock_markers      (MarkerArray)
-          /viz/fire_markers      (MarkerArray)
-          /viz/robot_markers     (MarkerArray)
-          /tf                    (static world→map)
-                          │
-                   foxglove_bridge
-                  ws://localhost:8765
-                          │
-                   Foxglove Studio
-                          │
-                    ros_bridge
-                 (ROS ↔ uAgent)
-                          │
-           ┌──────────────┴──────────────┐
-        scout uAgent           firefighter uAgents
-        (Gemini VLM)           (move / spray / refill)
+┌─────────────────────────────────────────────────────────────┐
+│     Gazebo Harmonic (headless: gz sim -s -r, local host)    │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                       ROS 2 Humble
+                              │
+     ┌────────────────────────┼────────────────────────┐
+     │                        │                        │
+fire_grid_node           scout (ROS)          firefighter_1..N
+  /fire_grid            position_controller     navigation + water
+  /water_spray          /scout/...              /cmd_vel, /water_level
+     │                        │                        │
+     └────────────────────────┼────────────────────────┘
+                              │
+              foxglove_viz (8765) + scene_publisher_3d (8766)
+                    foxglove-sdk WebSocket servers
+                              │
+                     Foxglove Studio (2 connections)
+                              │
+                        ros_bridge node
+                              │
+              ┌───────────────┴───────────────┐
+         ScoutUAgent (8000)              FirefighterAgent (8001+)
+         + ScoutADKAgent                  uAgents
 ```
+
+Visualization does **not** use `ros-humble-foxglove-bridge`. Two **foxglove-sdk** servers run inside the workspace:
+
+| Port | Node | Purpose |
+|------|------|---------|
+| **8765** | `foxglove_viz` | Bird’s-eye `/viz/fire_image`, stats, agent status |
+| **8766** | `scene_publisher_3d` | 3D `SceneUpdate` on `/scene`, `FrameTransform` on `/tf` |
+
+Open **two** Foxglove WebSocket connections (`ws://localhost:8765` and `ws://localhost:8766`) to see 2D and 3D together. For the 3D panel, set **Fixed frame** to `world`.
 
 ## Prerequisites
 
 | Component | Version | Notes |
 |-----------|---------|-------|
-| ROS 2 | Humble | via RoboStack or native install |
-| Gazebo | Harmonic (gz-harmonic) | installed locally via Homebrew or apt |
-| Python | 3.10+ | |
-| Foxglove Studio | Latest | Desktop app or web — connects to `ws://localhost:8765` |
-| foxglove_bridge | ROS 2 package | `apt install ros-humble-foxglove-bridge` or conda equivalent |
-| Google API key | — | For Gemini VLM |
+| ROS 2 | **Humble** | Native install or [RoboStack](https://robostack.github.io/) conda |
+| Gazebo | **Harmonic** (`gz` 8.x) | **Host install** — not inside Docker/conda; [macOS](https://gazebosim.org/docs/harmonic/install/) via Homebrew `gz-harmonic` |
+| Python | 3.10+ (3.11–3.12 typical with conda) | Must match what `colcon` passes to CMake |
+| Foxglove Studio | [Latest](https://foxglove.dev/download) | Desktop or web — connects to localhost WebSockets |
+| Google API key | — | `GOOGLE_API_KEY` or `GEMINI_API_KEY` for Gemini (fire init + scout) |
 
-### Gazebo Harmonic (local install)
-
-Gazebo Harmonic must be installed directly on the host machine (not inside
-Docker or conda). It runs in server-only mode (`gz sim -s -r`) — no GPU or
-display server is required.
-
-**macOS (Apple Silicon):**
+### Gazebo Harmonic (host)
 
 ```bash
-# Deactivate conda first — conda and Homebrew system libs conflict
+# macOS (Apple Silicon): deactivate conda first — avoids lib conflicts with Homebrew
 conda deactivate
-
-brew tap osrf/simulation
-brew install gz-harmonic
-
-# Verify
+brew tap osrf/simulation && brew install gz-harmonic
 gz sim --version   # expect 8.x.x
 ```
 
-**Ubuntu / Debian:**
-
 ```bash
-sudo apt-get update
-sudo apt-get install gz-harmonic
+# Ubuntu / Debian
+sudo apt-get update && sudo apt-get install gz-harmonic
 gz sim --version
 ```
 
-### RoboStack conda environment (recommended for ROS 2)
+### RoboStack (optional, recommended on macOS)
 
 ```bash
 conda create -n wildfire python=3.11
 conda activate wildfire
-conda install -c robostack-staging ros-humble-desktop
-conda install -c robostack-staging ros-humble-ros-gz
-conda install -c robostack-staging ros-humble-foxglove-bridge
+conda install -c robostack-staging ros-humble-desktop ros-humble-ros-gz
 ```
 
-### Foxglove Studio
+You do **not** need `ros-humble-foxglove-bridge` for this repo’s visualization.
 
-Download the desktop app from <https://foxglove.dev/download> or use the web
-version at <https://app.foxglove.dev>. No install is needed on the simulation
-host — Foxglove connects over WebSocket from any machine on the same network.
+## Quick setup
 
-## Setup
+From the repository root (with ROS 2 already sourced):
 
 ```bash
-cd /path/to/BeachHacks2026
-
-# Install Python dependencies
-pip install -r requirements.txt
-
-# Build the ROS 2 workspace
-colcon build --cmake-args -DPython3_EXECUTABLE=$(which python3)
-
-# Fix executable paths (conda/macOS quirk)
-for pkg in scout_robot firefighter_robot wildfire_agents; do
-    mkdir -p "install/$pkg/lib/$pkg"
-    for script in install/$pkg/bin/*; do
-        [ -f "$script" ] && ln -sf "$(pwd)/$script" "install/$pkg/lib/$pkg/$(basename "$script")"
-    done
-done
-
-# Source the workspace
+./setup.sh
 source install/setup.bash
 ```
+
+`setup.sh` installs Python deps, runs `colcon build` (with macOS-friendly CMake Python flags), and creates `install/<pkg>/lib/<pkg>` symlinks so `ros2 launch` finds Python entry points.
+
+### Manual setup (same as above without the script)
+
+```bash
+pip install -r requirements.txt
+
+# Linux
+colcon build --symlink-install --cmake-args -DPython3_EXECUTABLE=$(which python3)
+
+# macOS (often omit --symlink-install; see setup.sh)
+colcon build --cmake-args -DPython3_EXECUTABLE=$(which python3) -DPython_EXECUTABLE=$(which python3)
+
+# macOS: symlink executables into lib/<pkg>/
+for pkg in scout_robot firefighter_robot wildfire_agents; do
+  mkdir -p "install/$pkg/lib/$pkg"
+  for script in install/$pkg/bin/*; do
+    [ -f "$script" ] && ln -sf "$(pwd)/$script" "install/$pkg/lib/$pkg/$(basename "$script")"
+  done
+done
+
+source install/setup.bash
+```
+
+### Python dependencies note
+
+`requirements.txt` pins `uagents` and pulls in **google-adk** (needs **pydantic v2**). If `pip` reports a conflict, follow the comment at the bottom of `requirements.txt` (install order / `--force-reinstall` for `google-adk` and pydantic). First run also downloads **Depth Anything V2** weights via Hugging Face — expect a large download and GPU/CPU time.
+
+### Optional: `run_sim.sh` (developer convenience)
+
+`run_sim.sh` is a **macOS-oriented** helper that kills stale processes, activates a specific conda env, rebuilds, sources `.env` if present, and launches the sim. Adjust paths inside the script for your machine or use the generic `ros2 launch` flow below.
+
+## Configuration & environment
+
+| Variable | Purpose |
+|----------|---------|
+| `GOOGLE_API_KEY` or `GEMINI_API_KEY` | Gemini (fire shape from image, scout assignments) |
+| `WILDFIRE_IMAGE_PATH` | Aerial image for Depth Anything + VLM fire mask (default: `wildfire.png` in repo root) |
+| `NUM_FIREFIGHTERS` | Set by launch; number of firefighter uAgents (`8001` …) |
+| `USE_VLM` | Passed through to the scout stack (`use_vlm` launch arg) |
+| `ADK_MODEL` | Override Gemini model for the scout (default `gemini-2.5-flash-lite`) |
+
+You can place keys in a **`.env`** file in the repo root and `source` it before launch (do **not** commit secrets).
 
 ## Running
 
 ```bash
-# Set your Google API key (required for VLM mode)
-export GOOGLE_API_KEY="your-api-key-here"
+export GOOGLE_API_KEY="your-key-here"
+# optional: export WILDFIRE_IMAGE_PATH="/path/to/aerial.png"
 
-# Launch with defaults (4 firefighters, VLM enabled)
+source install/setup.bash
 ros2 launch wildfire_gazebo wildfire_sim.launch.py
-
-# Custom number of firefighters
-ros2 launch wildfire_gazebo wildfire_sim.launch.py num_firefighters:=6
-
-# Without VLM (uses grid-based fallback analysis)
-ros2 launch wildfire_gazebo wildfire_sim.launch.py use_vlm:=false
 ```
 
-The launch file automatically starts Gazebo in headless mode on macOS. It also
-launches `foxglove_bridge` (port 8765) and `scene_publisher_3d` for 3D
-visualization.
+### Launch arguments
 
-### Viewing in Foxglove Studio
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `num_firefighters` | `4` | Number of firefighter ROS namespaces / uAgents |
+| `use_vlm` | `true` | Forwarded as `USE_VLM` (scout configuration) |
+| `headless` | `true` on macOS, `false` otherwise | Declared for tooling; Gazebo is launched with `-s -r` |
+| `image_path` | `WILDFIRE_IMAGE_PATH` or `./wildfire.png` | Aerial image for terrain + initial fire |
 
-1. Open Foxglove Studio
-2. Choose **Open connection** > **Foxglove WebSocket** > `ws://localhost:8765`
-3. Add a **3D** panel
-4. Set **Fixed frame** to `world`
-5. The panel auto-discovers marker topics — you should see procedural terrain,
-   trees, rocks, fire spreading, and robot positions updating in real time
+Examples:
 
-Key topics for the 3D panel:
+```bash
+ros2 launch wildfire_gazebo wildfire_sim.launch.py num_firefighters:=6
+ros2 launch wildfire_gazebo wildfire_sim.launch.py use_vlm:=false image_path:=$(pwd)/wildfire.png
+```
 
-| Topic | Type | Content |
-|-------|------|---------|
-| `/viz/terrain_markers` | MarkerArray | 20×20 noise-based terrain tiles |
-| `/viz/tree_markers` | MarkerArray | ~100 procedurally placed trees |
-| `/viz/rock_markers` | MarkerArray | ~30 scattered rock formations |
-| `/viz/fire_markers` | MarkerArray | Volumetric fire cubes (height = intensity) |
-| `/viz/robot_markers` | MarkerArray | Firefighters, scout drone, water supply |
-| `/viz/fire_image` | Image | 2D bird's-eye view (used by VLM) |
+If Gemini is unavailable at startup, `fire_grid_node` falls back to a **circular** initial fire blob.
 
-## Packages
+### Foxglove Studio
+
+1. Open Foxglove → **Open connection** → **Foxglove WebSocket** → `ws://localhost:8765` (2D + status).
+2. Add another connection → `ws://localhost:8766` (3D scene).
+3. Add a **3D** panel, **Fixed frame** `world`, subscribe to `/scene` on the **8766** connection.
+
+ROS topic `/viz/fire_image` remains available for nodes and for debugging; the scout consumes the rendered bird’s-eye view path via the bridge as designed.
+
+## Repository layout
+
+```
+BeachHacks2026/
+├── setup.sh / run_sim.sh
+├── requirements.txt
+├── wildfire.png                 # default aerial for world init
+└── src/
+    ├── wildfire_msgs/           # FireGrid, commands, status
+    ├── wildfire_gazebo/         # world, launch, fire_params.yaml
+    ├── scout_robot/             # URDF, position controller
+    ├── firefighter_robot/       # navigation, water manager
+    └── wildfire_agents/         # fire grid, ADK scout, uAgents, ros_bridge,
+                                 # foxglove_viz, scene_publisher_3d, sim odometry
+```
+
+## ROS packages
 
 | Package | Type | Description |
 |---------|------|-------------|
-| `wildfire_msgs` | CMake | Custom ROS 2 messages: FireGrid, FirefighterStatus, MoveCommand, RefillCommand |
-| `wildfire_gazebo` | CMake | Gazebo world (with procedural rocks/mounds), launch file, fire parameters |
-| `scout_robot` | Python | Scout drone URDF + position controller |
-| `firefighter_robot` | Python | Firefighter URDF + navigation controller + water manager |
-| `wildfire_agents` | Python | uAgent logic, Gemini VLM, fire grid sim, viz renderer, 3D scene publisher, ROS bridge |
+| `wildfire_msgs` | CMake | `FireGrid`, firefighter status, commands |
+| `wildfire_gazebo` | CMake | World, `wildfire_sim.launch.py`, `fire_params.yaml` |
+| `scout_robot` | Python | Scout URDF + `position_controller` |
+| `firefighter_robot` | Python | URDF + `navigation_controller` + `water_manager` |
+| `wildfire_agents` | Python | Grid sim, world init (depth + Gemini), ADK scout, uAgents, `ros_bridge`, Foxglove nodes |
 
-## How It Works
+## How it works
 
-1. **Fire Grid Node** simulates fire spread on a 20×20 grid with wind-biased
-   probabilistic spreading. Fire starts as a blob at grid center.
+1. **`fire_grid_node`** simulates fire on a **50×50** grid (see `fire_params.yaml`). At startup, **`world_init`** uses **Gemini** on the aerial image to infer a **12×12** fire mask (mapped into the grid) and **Depth Anything V2** for terrain height; on failure, a circular seed is used.
 
-2. **Viz Renderer** subscribes to the fire grid and renders a bird's-eye image
-   showing fire (red), unburned terrain (green), firefighters (yellow), and the
-   water supply (blue). Published on `/viz/fire_image`.
+2. **`foxglove_viz`** renders the bird’s-eye view and streams it on WebSocket **8765**; it also publishes `sensor_msgs/Image` on `/viz/fire_image`.
 
-3. **3D Scene Publisher** generates a procedural 3D environment (terrain with
-   fractal noise height, ~100 trees via rejection sampling, ~30 rocks) and
-   converts the fire grid + robot odometry into `MarkerArray` messages that
-   Foxglove Studio renders in its 3D panel.
+3. **`scene_publisher_3d`** streams procedural 3D terrain, trees, rocks, fire, and robots on WebSocket **8766** (`/scene`, `/tf`).
 
-4. **Scout Agent** (uAgent on port 8000) periodically captures the bird's-eye
-   image and sends it to **Gemini 2.0 Flash** for tactical analysis. The VLM
-   returns fire locations, recommended positions, and threat level as JSON.
+4. **`ScoutADKAgent`** uses grid state + firefighter state: a **deterministic** path when rules fully decide moves; otherwise **one Gemini call** returns JSON assignments. **`ScoutUAgent`** (port **8000**) carries uAgent messaging; firefighters listen on **8001+**.
 
-5. **Scout allocates firefighters** using greedy nearest-neighbour matching
-   between available firefighters and recommended positions.
+5. **`ros_bridge`** runs uAgents on background threads and maps ROS topics ↔ agent commands.
 
-6. **Firefighter Agents** (uAgents on ports 8001+) receive `MoveCommand` and
-   `RefillCommand` messages. They navigate to targets, spray water at fires,
-   and return to the water supply when low on water.
+6. **`sim_odom_node`** integrates motion for the demo (no full Gazebo robot plugins required for the grid-driven behavior).
 
-7. **ROS Bridge** runs all uAgents in daemon threads and translates between
-   ROS topics and uAgent messages.
+## Tuning fire & agents
 
-## Configuration
-
-Edit `src/wildfire_gazebo/config/fire_params.yaml`:
+**Fire grid** — `src/wildfire_gazebo/config/fire_params.yaml`:
 
 ```yaml
 fire_grid_node:
   ros__parameters:
-    grid_size: 20
+    grid_size: 50
     cell_size: 1.0
     base_spread_prob: 0.05
     wind_factor: 2.0
-    wind_direction: 45.0    # degrees (0=N, 90=E)
+    wind_direction: 45.0    # degrees
     update_rate: 1.0
     initial_fire_radius: 2
+    fire_start_x: 0.0
+    fire_start_y: 12.0
 ```
+
+**Bridge / scout intervals** — `src/wildfire_agents/config/agent_config.yaml` (`scout_port`, `analysis_interval`, etc.).
 
 ## License
 
-Apache-2.0
+Apache-2.0 (see package `license` tags under `src/*/package.xml`).
