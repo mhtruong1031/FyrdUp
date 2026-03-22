@@ -49,8 +49,21 @@ facing conical field of view that projects as a circle on the ground.
 | move_scout | Set your absolute (x, y, z) position in world coordinates.  z is altitude. |
 | adjust_altitude | Change altitude by a signed delta (positive = up). |
 | get_fire_status | Global fire statistics: total burning cells, centroid, bounding box. |
+| get_fire_perimeter | Returns a list of world (x, y) coordinates that are NOT burning but are immediately ADJACENT to a burning cell.  Use these as valid firefighter assignment targets. |
 | get_firefighter_positions | Positions, water levels, and states of every firefighter. |
 | assign_firefighter | Command a specific firefighter to move to a world (x, y) position. |
+| refill_firefighter | Send a firefighter to the water supply at (0, 0) to refill its tank. |
+
+## CRITICAL RULES
+- NEVER assign a firefighter to a cell that is ON FIRE.
+- ALWAYS call **get_fire_perimeter()** first, then pick positions from the
+  returned list.  Only assign firefighters to coordinates from that list.
+- Do NOT reassign a firefighter that is already in MOVING state unless the
+  fire has shifted significantly.  Let them reach their target first.
+- **Water management**: Each firefighter has a 100-unit water tank.  When a
+  firefighter's water_level drops below 20, call **refill_firefighter** to
+  send it to the water supply at (0, 0).  Do NOT assign low-water
+  firefighters to fire positions — send them to refill first.
 
 ## Goals (priority order)
 1. Keep **ALL** active fire cells within your field of view.
@@ -65,9 +78,10 @@ facing conical field of view that projects as a circle on the ground.
 - If more than 60 % of the view is empty non-fire, non-firefighter space,
   **adjust_altitude** downward (−1 to −3) for higher resolution.
 - After each adjustment call **get_current_fov()** again to verify.
-- Once you are satisfied with coverage, call **get_fire_status** and
-  **get_firefighter_positions**, then **assign_firefighter** for each
-  available firefighter to an optimal fire-perimeter position.
+- Once you are satisfied with coverage, call **get_fire_status**,
+  **get_fire_perimeter**, and **get_firefighter_positions**, then
+  **assign_firefighter** for each available firefighter to a perimeter
+  position from the list returned by get_fire_perimeter.
 - Distribute firefighters evenly around the perimeter; prefer upwind.
 - When finished, reply with a short tactical summary.
 """
@@ -83,7 +97,7 @@ class ScoutADKAgent:
     def __init__(
         self,
         use_vlm: bool = True,
-        analysis_interval: float = 10.0,
+        analysis_interval: float = 20.0,
     ):
         self.use_vlm = use_vlm
         self.analysis_interval = analysis_interval
@@ -96,9 +110,12 @@ class ScoutADKAgent:
         self.scout_position: List[float] = [0.0, 0.0, 15.0]  # x, y, z
         self.firefighter_status: Dict[str, dict] = {}
 
+        self.water_supply_position = [0.0, 0.0]  # world (x, y) of refill station
+
         # callbacks wired by the bridge
         self.on_move_scout: Optional[callable] = None       # (x, y, z)
         self.on_assign_firefighter: Optional[callable] = None  # (ff_id, x, y)
+        self.on_refill_firefighter: Optional[callable] = None  # (ff_id)
 
         self._build_adk_agent()
 
@@ -154,6 +171,14 @@ class ScoutADKAgent:
             """Return global fire statistics: burning count, centroid, bounding box."""
             return self_ref._fire_status()
 
+        def get_fire_perimeter() -> dict:
+            """Return world coordinates of non-burning cells adjacent to burning cells.
+
+            These are safe positions for firefighters to stand and spray.
+            Returns a dict with 'perimeter' (list of [x, y] pairs) and 'count'.
+            """
+            return self_ref._fire_perimeter()
+
         def get_firefighter_positions() -> dict:
             """Return every firefighter's position, water level, and state."""
             out = {}
@@ -173,10 +198,49 @@ class ScoutADKAgent:
                 target_x: World x coordinate for the firefighter.
                 target_y: World y coordinate for the firefighter.
             """
+            # Guard: skip if firefighter is MOVING and new target is close
+            st = self_ref.firefighter_status.get(firefighter_id)
+            if st and st["state"] == "MOVING":
+                old_pos = st["position"]
+                dist_to_new = math.hypot(target_x - old_pos[0], target_y - old_pos[1])
+                if dist_to_new < 5.0:
+                    return {
+                        "status": "skipped",
+                        "reason": f"{firefighter_id} is already MOVING; "
+                                  f"new target only {dist_to_new:.1f}m away. "
+                                  f"Let it arrive first.",
+                        "firefighter_id": firefighter_id,
+                    }
+
+            # Safety net: snap on-fire targets to nearest perimeter cell
+            target_x, target_y, snapped = self_ref._snap_off_fire(
+                target_x, target_y)
             if self_ref.on_assign_firefighter:
                 self_ref.on_assign_firefighter(firefighter_id, target_x, target_y)
-            return {"status": "ok", "firefighter_id": firefighter_id,
-                    "target": [target_x, target_y]}
+            result = {"status": "ok", "firefighter_id": firefighter_id,
+                      "target": [target_x, target_y]}
+            if snapped:
+                result["warning"] = "Target was on a burning cell; snapped to nearest safe cell."
+            return result
+
+        def refill_firefighter(firefighter_id: str) -> dict:
+            """Send a firefighter to the water supply at (0, 0) to refill its tank.
+
+            Use this when a firefighter's water_level is below 20.
+            The firefighter will stop spraying, navigate to the supply, refill,
+            and become IDLE once full.
+
+            Args:
+                firefighter_id: e.g. 'firefighter_1'.
+            """
+            if self_ref.on_refill_firefighter:
+                self_ref.on_refill_firefighter(firefighter_id)
+            return {
+                "status": "ok",
+                "firefighter_id": firefighter_id,
+                "target": self_ref.water_supply_position,
+                "note": "Firefighter is heading to water supply to refill.",
+            }
 
         model_name = os.environ.get("ADK_MODEL", "gemini-2.5-flash-lite")
 
@@ -190,8 +254,10 @@ class ScoutADKAgent:
                 move_scout,
                 adjust_altitude,
                 get_fire_status,
+                get_fire_perimeter,
                 get_firefighter_positions,
                 assign_firefighter,
+                refill_firefighter,
             ],
         )
 
@@ -477,6 +543,58 @@ class ScoutADKAgent:
             "bounding_box": bbox,
             "threat_level": threat,
         }
+
+    # -- fire perimeter helper ------------------------------------------------
+
+    def _fire_perimeter(self) -> dict:
+        """Non-burning cells adjacent to at least one burning cell."""
+        if self.fire_grid is None:
+            return {"perimeter": [], "count": 0}
+
+        n = self.grid_size
+        cs = self.cell_size
+        perimeter_set: set[tuple[int, int]] = set()
+
+        for gy in range(n):
+            for gx in range(n):
+                if self.fire_grid[gy * n + gx] < 0.1:
+                    continue
+                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nx, ny = gx + dx, gy + dy
+                    if 0 <= nx < n and 0 <= ny < n:
+                        if self.fire_grid[ny * n + nx] < 0.1:
+                            perimeter_set.add((nx, ny))
+
+        perimeter_world = []
+        for gx, gy in perimeter_set:
+            wx = round((gx - n / 2.0 + 0.5) * cs, 2)
+            wy = round((gy - n / 2.0 + 0.5) * cs, 2)
+            perimeter_world.append([wx, wy])
+
+        return {"perimeter": perimeter_world, "count": len(perimeter_world)}
+
+    def _snap_off_fire(self, x: float, y: float) -> tuple[float, float, bool]:
+        """If (x, y) lands on a burning cell, snap to the nearest perimeter cell."""
+        if self.fire_grid is None:
+            return x, y, False
+
+        n = self.grid_size
+        cs = self.cell_size
+        half = n * cs / 2.0
+        gx = int((x + half) / cs)
+        gy = int((y + half) / cs)
+
+        if not (0 <= gx < n and 0 <= gy < n):
+            return x, y, False
+        if self.fire_grid[gy * n + gx] < 0.1:
+            return x, y, False
+
+        perim = self._fire_perimeter()["perimeter"]
+        if not perim:
+            return x, y, False
+
+        best = min(perim, key=lambda p: math.hypot(p[0] - x, p[1] - y))
+        return best[0], best[1], True
 
 
 # ---------------------------------------------------------------------------

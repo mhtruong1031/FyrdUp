@@ -8,6 +8,7 @@ through the bridge's ROS publishers rather than uAgent messages.
 """
 
 import asyncio
+import logging
 import math
 import os
 import threading
@@ -90,6 +91,7 @@ class ROSBridge(Node):
         # Wire ADK scout callbacks
         self.scout_agent.on_move_scout = self._handle_scout_move
         self.scout_agent.on_assign_firefighter = self._handle_assign_firefighter
+        self.scout_agent.on_refill_firefighter = self._handle_refill_firefighter
 
         # Periodic ADK analysis timer
         interval = scout_agent.analysis_interval
@@ -173,10 +175,31 @@ class ROSBridge(Node):
     def _handle_assign_firefighter(self, ff_id, target_x, target_y):
         pt = Point(x=float(target_x), y=float(target_y), z=0.0)
         self._ff_fire_targets[ff_id] = (target_x, target_y)
+        if ff_id in self.firefighter_agents:
+            ff = self.firefighter_agents[ff_id]
+            ff.target_position = (target_x, target_y)
+            ff.state = 'MOVING'
         if ff_id in self.target_position_pubs:
             self.target_position_pubs[ff_id].publish(pt)
             self.get_logger().info(
                 f'[BRIDGE] Assign {ff_id} → ({target_x:.1f}, {target_y:.1f})')
+        else:
+            self.get_logger().error(
+                f'[BRIDGE] No publisher for {ff_id}')
+
+    def _handle_refill_firefighter(self, ff_id):
+        refill_pos = (0.0, 0.0)
+        pt = Point(x=refill_pos[0], y=refill_pos[1], z=0.0)
+        if ff_id in self.firefighter_agents:
+            ff = self.firefighter_agents[ff_id]
+            ff.target_position = refill_pos
+            ff.state = 'REFILLING'
+        if ff_id in self.spray_enable_pubs:
+            self.spray_enable_pubs[ff_id].publish(Bool(data=False))
+        if ff_id in self.target_position_pubs:
+            self.target_position_pubs[ff_id].publish(pt)
+            self.get_logger().info(
+                f'[BRIDGE] Refill {ff_id} → ({refill_pos[0]:.1f}, {refill_pos[1]:.1f})')
         else:
             self.get_logger().error(
                 f'[BRIDGE] No publisher for {ff_id}')
@@ -242,6 +265,9 @@ def _run_agent(agent):
 def main(args=None):
     from .scout_agent import ScoutADKAgent
     from .firefighter_agent import FirefighterAgent
+
+    logging.getLogger('uagents').setLevel(logging.WARNING)
+    logging.getLogger('asyncio').setLevel(logging.WARNING)
 
     rclpy.init(args=args)
 

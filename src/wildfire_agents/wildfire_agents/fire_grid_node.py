@@ -87,8 +87,14 @@ class FireGridNode(Node):
                     self.fire_intensity[gy * n + gx] = 1.0
 
             self.heightmap = compute_heightmap(image_path, n)
-            self.get_logger().info(
-                f'[FIRE] Loaded heightmap and {len(fire_cells)} fire cells from VLM')
+
+            if not fire_cells:
+                self.get_logger().warning(
+                    '[FIRE] VLM returned 0 fire cells; falling back to circular blob')
+                self._fallback_circle_init(n)
+            else:
+                self.get_logger().info(
+                    f'[FIRE] Loaded heightmap and {len(fire_cells)} fire cells from VLM')
         except Exception as exc:
             self.get_logger().warning(
                 f'[FIRE] Image init failed ({exc}); falling back to circular blob')

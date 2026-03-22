@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
 
 # ── Kill any existing simulation processes ──────────────────────────────────
 echo "[run_sim] Stopping existing processes..."
@@ -22,8 +22,32 @@ CONDA_SH="/opt/homebrew/Caskroom/miniconda/base/etc/profile.d/conda.sh"
 # ── Activate conda + ROS 2 overlay ─────────────────────────────────────────
 source "$CONDA_SH"
 conda activate ros2
-cd "$SCRIPT_DIR/install" && source local_setup.bash
+
+# ── Rebuild packages ──────────────────────────────────────────────────────
+echo "[run_sim] Building workspace..."
 cd "$SCRIPT_DIR"
+CONDA_PREFIX="${CONDA_PREFIX:-/opt/homebrew/Caskroom/miniconda/base/envs/ros2}"
+if ! colcon build \
+    --parallel-workers "$(sysctl -n hw.ncpu)" \
+    --cmake-args \
+        -DPython_ROOT_DIR="$CONDA_PREFIX" \
+        -DPython_FIND_STRATEGY=LOCATION \
+        -DPython_LIBRARY="$CONDA_PREFIX/lib/libpython3.12.dylib" \
+        -DPython3_EXECUTABLE="$CONDA_PREFIX/bin/python3" \
+    2>&1 | tail -n 8; then
+    echo "[run_sim] ERROR: colcon build failed — aborting."
+    exit 1
+fi
+
+# Executables land in bin/ without --symlink-install; ROS 2 expects lib/<pkg>/
+for pkg in scout_robot firefighter_robot wildfire_agents; do
+    mkdir -p "install/$pkg/lib/$pkg"
+    for script in install/$pkg/bin/*; do
+        [ -f "$script" ] && ln -sf "$SCRIPT_DIR/$script" "install/$pkg/lib/$pkg/$(basename "$script")"
+    done
+done
+
+cd "$SCRIPT_DIR/install" && source local_setup.bash && cd "$SCRIPT_DIR"
 
 # ── Environment variables ──────────────────────────────────────────────────
 if [ -f "$SCRIPT_DIR/.env" ]; then
