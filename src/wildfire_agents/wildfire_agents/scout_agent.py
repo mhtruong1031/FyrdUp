@@ -52,6 +52,17 @@ firefighter positions, decide what each firefighter should do.
 - **Under normal circumstances, spreading out is mandatory.** Your default
   goal is to place firefighters around the fire **perimeter** so they cover
   different sectors of the blaze, not stacked on the same side.
+- **Even formation around the fire:** Treat the fire **centroid** (from
+  state.fire) as the center. For **N** available firefighters who need a
+  **move** assignment, split the compass into **N roughly equal wedges**
+  (every 360/N degrees). Pick one perimeter point **per wedge** from the
+  perimeter list so units sit like spokes on a wheel—**evenly spaced**
+  around the blaze.
+- **Concrete example:** With **four** firefighters all attacking (not
+  refilling), aim for a **four-point formation**: one on each **side** of
+  the fire—e.g. north, east, south, and west of the centroid (or four
+  perimeter targets spaced ~90° apart in bearing from the centroid). Same
+  idea for **three** (~120° apart) or **two** (~180° apart, opposite flanks).
 - Maximize **angular separation** around the fire centroid: imagine the
   perimeter as a ring—pick targets that are far apart along that ring.
 - Maximize **pairwise distance** between firefighters: avoid clustering;
