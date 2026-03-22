@@ -1,31 +1,25 @@
 #!/usr/bin/env python3
 """
-Scout ADK Agent — aerial coordinator for wildfire firefighting.
+Scout Agent — aerial coordinator for wildfire firefighting.
 
-Uses Google ADK (Agent Development Kit) with Gemini to agentically:
-  1. Render its conical field-of-view onto the fire grid
-  2. Adjust position / altitude until all fire + firefighters are in view
-  3. Allocate firefighters to optimal perimeter positions
+Single-shot design: each analysis cycle computes all state locally,
+positions the scout deterministically above the fire centroid, then
+makes ONE Gemini API call to decide firefighter assignments.
 
-The bridge calls ``run_analysis()`` on a timer; the ADK agent iterates
-internally via tool calls until it is satisfied with coverage.
+The bridge calls ``run_analysis()`` on a timer.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import math
 import os
 from typing import Dict, List, Optional, Tuple
 
-import cv2
 import numpy as np
 
-from google.adk.agents import Agent
-from google.adk.runners import InMemoryRunner
-from google.adk.sessions import InMemorySessionService
-from google.genai.types import Content, Part
+import google.genai as genai
+from google.genai import types
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -35,64 +29,81 @@ FOV_HALF_ANGLE_DEG = 35.0
 FOV_HALF_ANGLE_RAD = math.radians(FOV_HALF_ANGLE_DEG)
 MIN_ALTITUDE = 5.0
 MAX_ALTITUDE = 40.0
-FOV_IMAGE_PX = 256  # rendered FOV image side length
 
-SCOUT_INSTRUCTION = """\
-You are a scout drone monitoring a wildfire from above.  You have a downward-
-facing conical field of view that projects as a circle on the ground.
+REFILL_WATER_THRESHOLD = 20.0
+FIRE_CELL_THRESHOLD = 0.1
 
-## Available tools
+ASSIGNMENT_PROMPT = """\
+You are a wildfire tactical coordinator.  Given the current fire state and
+firefighter positions, decide what each firefighter should do.
 
-| Tool | Purpose |
-|------|---------|
-| get_current_fov | Capture what you see right now.  Returns structured data about visible fire cells, visible firefighters, coverage statistics, and a base64 PNG of the view. |
-| move_scout | Set your absolute (x, y, z) position in world coordinates.  z is altitude. |
-| adjust_altitude | Change altitude by a signed delta (positive = up). |
-| get_fire_status | Global fire statistics: total burning cells, centroid, bounding box. |
-| get_fire_perimeter | Returns a list of world (x, y) coordinates that are NOT burning but are immediately ADJACENT to a burning cell.  Use these as valid firefighter assignment targets. |
-| get_firefighter_positions | Positions, water levels, and states of every firefighter. |
-| assign_firefighter | Command a specific firefighter to move to a world (x, y) position. |
-| refill_firefighter | Send a firefighter to the water supply at (0, 0) to refill its tank. |
+## Rules
+- NEVER send a firefighter onto a burning cell.
+- Only assign firefighters to positions from the **perimeter** list below.
+- If a firefighter's water_level < 20, it MUST refill (action="refill").
+- If a firefighter is MOVING, leave it alone (action="hold") unless its
+  target area is no longer on fire.
+- If a firefighter is FIGHTING and there is still fire near it, keep it
+  there (action="hold").
+- If a firefighter is IDLE or its fire is out, assign it to an
+  unassigned perimeter position (action="move").
 
-## CRITICAL RULES
-- NEVER assign a firefighter to a cell that is ON FIRE.
-- ALWAYS call **get_fire_perimeter()** first, then pick positions from the
-  returned list.  Only assign firefighters to coordinates from that list.
-- Do NOT reassign a firefighter that is already in MOVING state unless the
-  fire has shifted significantly.  Let them reach their target first.
-- **Water management**: Each firefighter has a 100-unit water tank.  When a
-  firefighter's water_level drops below 20, call **refill_firefighter** to
-  send it to the water supply at (0, 0).  Do NOT assign low-water
-  firefighters to fire positions — send them to refill first.
+## Spacing — default behavior (when `rescue.active` is false)
+- **Under normal circumstances, spreading out is mandatory.** Your default
+  goal is to place firefighters around the fire **perimeter** so they cover
+  different sectors of the blaze, not stacked on the same side.
+- Maximize **angular separation** around the fire centroid: imagine the
+  perimeter as a ring—pick targets that are far apart along that ring.
+- Maximize **pairwise distance** between firefighters: avoid clustering;
+  if two units are already close, assign moves to **opposite** or **distant**
+  perimeter arcs when you issue new positions.
+- Prefer perimeter points in **empty** wedges (no teammate nearby along
+  the fire edge) before reusing a congested sector.
+- Do not assign two robots to the same perimeter coordinate; avoid adjacent
+  perimeter cells when other valid coordinates exist.
 
-## Goals (priority order)
-1. Keep **ALL** active fire cells within your field of view.
-2. Keep **ALL** firefighter robots within your field of view.
-3. Minimise wasted (empty) space — fly lower when you can for better detail.
+## Rescue (highest priority when `rescue.active` is true)
+- Some units may be **in_danger** (on a burning cell or encircled by fire).
+  They often cannot path out because every route is blocked by fire.
+- When `rescue.active` is true, you MUST task **at least one** other
+  firefighter who has water_level >= 20 and is not already critical with
+  a **move** to a perimeter point from the list that is **closest** to the
+  trapped teammate's position (among perimeter coordinates), so they can
+  spray and shrink the fire next to that teammate. Use two rescuers if
+  multiple teammates are in danger or one rescuer is far away.
+- Prefer rescuers who are IDLE or FIGHTING in a low-threat sector; you may
+  override a simple "hold" for FIGHTING rescuers if they are the best
+  option to save someone in_danger.
+- Still never assign any move target onto a burning cell; only use
+  perimeter list coordinates.
+- Trapped units: if they have water and are in_danger, usually **hold** so
+  they keep spraying; if water_level < 20, **refill** only if a safe path
+  exists conceptually—when impossible, prioritize others clearing fire
+  toward them first (move rescuers closer).
+- After rescue needs are addressed, return to **wide spacing** for everyone
+  you move (same rules as the Spacing section).
 
-## Strategy
-- Start by calling **get_current_fov()** to assess your current view.
-- If any fire edges are clipped or firefighters are missing, either
-  **move_scout** toward the centroid of the missing elements or
-  **adjust_altitude** upward (+2 to +5 metres).
-- If more than 60 % of the view is empty non-fire, non-firefighter space,
-  **adjust_altitude** downward (−1 to −3) for higher resolution.
-- After each adjustment call **get_current_fov()** again to verify.
-- Once you are satisfied with coverage, call **get_fire_status**,
-  **get_fire_perimeter**, and **get_firefighter_positions**, then
-  **assign_firefighter** for each available firefighter to a perimeter
-  position from the list returned by get_fire_perimeter.
-- Distribute firefighters evenly around the perimeter; prefer upwind.
-- When finished, reply with a short tactical summary.
+## State
+{state_json}
+
+## Response format — ONLY valid JSON, no markdown fences
+{{
+  "assignments": [
+    {{"firefighter_id": "firefighter_1", "action": "move", "target": [x, y]}},
+    {{"firefighter_id": "firefighter_2", "action": "refill"}},
+    {{"firefighter_id": "firefighter_3", "action": "hold"}}
+  ],
+  "scout_summary": "one sentence tactical note"
+}}
+
+"action" must be one of: "move", "refill", "hold".
+"target" is required only when action is "move" and MUST be a coordinate
+pair from the perimeter list.
 """
 
 
-# ---------------------------------------------------------------------------
-# Scout ADK Agent
-# ---------------------------------------------------------------------------
-
 class ScoutADKAgent:
-    """Wraps a Google ADK Agent and the state needed by its tools."""
+    """Single-shot scout agent: deterministic positioning + one LLM call."""
 
     def __init__(
         self,
@@ -102,253 +113,279 @@ class ScoutADKAgent:
         self.use_vlm = use_vlm
         self.analysis_interval = analysis_interval
 
-        # mutable state set by the ROS bridge
         self.fire_grid: Optional[List[float]] = None
         self.grid_size: int = 50
         self.cell_size: float = 1.0
 
-        self.scout_position: List[float] = [0.0, 0.0, 15.0]  # x, y, z
+        self.scout_position: List[float] = [0.0, 0.0, 15.0]
         self.firefighter_status: Dict[str, dict] = {}
 
-        self.water_supply_position = [0.0, 0.0]  # world (x, y) of refill station
+        self.water_supply_position = [0.0, 0.0]
 
-        # callbacks wired by the bridge
-        self.on_move_scout: Optional[callable] = None       # (x, y, z)
-        self.on_assign_firefighter: Optional[callable] = None  # (ff_id, x, y)
-        self.on_refill_firefighter: Optional[callable] = None  # (ff_id)
+        # Callbacks wired by the bridge
+        self.on_move_scout: Optional[callable] = None
+        self.on_assign_firefighter: Optional[callable] = None
+        self.on_refill_firefighter: Optional[callable] = None
 
-        self._build_adk_agent()
-
-    # -- ADK agent construction ----------------------------------------------
-
-    def _build_adk_agent(self):
-        self_ref = self  # closure capture
-
-        # ---- tool functions (plain functions with docstrings) ----
-
-        def get_current_fov() -> dict:
-            """Capture the scout's current conical field-of-view.
-
-            Returns a dict with keys:
-              scout_x, scout_y, scout_z,
-              fov_radius_cells, fire_cells_in_fov, fire_cells_total,
-              firefighters_in_fov (list of ids), firefighters_total,
-              fire_coverage_pct, empty_pct,
-              fire_centroid (x, y) in world coords or null,
-              fire_clipped (bool — true if any fire is outside the FOV),
-              fov_image_base64 (PNG)
-            """
-            return self_ref._compute_fov()
-
-        def move_scout(x: float, y: float, z: float) -> dict:
-            """Move the scout drone to absolute world position (x, y, z).
-
-            Args:
-                x: World x coordinate.
-                y: World y coordinate.
-                z: Altitude in metres (clamped to 5-40 m).
-            """
-            z = max(MIN_ALTITUDE, min(MAX_ALTITUDE, z))
-            self_ref.scout_position = [x, y, z]
-            if self_ref.on_move_scout:
-                self_ref.on_move_scout(x, y, z)
-            return {"status": "ok", "position": [x, y, z]}
-
-        def adjust_altitude(delta_z: float) -> dict:
-            """Raise (positive) or lower (negative) the scout by delta_z metres.
-
-            Args:
-                delta_z: Altitude change in metres.
-            """
-            new_z = max(MIN_ALTITUDE, min(MAX_ALTITUDE,
-                                          self_ref.scout_position[2] + delta_z))
-            self_ref.scout_position[2] = new_z
-            if self_ref.on_move_scout:
-                self_ref.on_move_scout(*self_ref.scout_position)
-            return {"status": "ok", "altitude": new_z}
-
-        def get_fire_status() -> dict:
-            """Return global fire statistics: burning count, centroid, bounding box."""
-            return self_ref._fire_status()
-
-        def get_fire_perimeter() -> dict:
-            """Return world coordinates of non-burning cells adjacent to burning cells.
-
-            These are safe positions for firefighters to stand and spray.
-            Returns a dict with 'perimeter' (list of [x, y] pairs) and 'count'.
-            """
-            return self_ref._fire_perimeter()
-
-        def get_firefighter_positions() -> dict:
-            """Return every firefighter's position, water level, and state."""
-            out = {}
-            for ff_id, st in self_ref.firefighter_status.items():
-                out[ff_id] = {
-                    "position": list(st["position"]),
-                    "water_level": st["water_level"],
-                    "state": st["state"],
-                }
-            return {"firefighters": out, "total": len(out)}
-
-        def assign_firefighter(firefighter_id: str, target_x: float, target_y: float) -> dict:
-            """Command a firefighter to move to a world (x, y) position.
-
-            Args:
-                firefighter_id: e.g. 'firefighter_1'.
-                target_x: World x coordinate for the firefighter.
-                target_y: World y coordinate for the firefighter.
-            """
-            # Guard: skip if firefighter is MOVING and new target is close
-            st = self_ref.firefighter_status.get(firefighter_id)
-            if st and st["state"] == "MOVING":
-                old_pos = st["position"]
-                dist_to_new = math.hypot(target_x - old_pos[0], target_y - old_pos[1])
-                if dist_to_new < 5.0:
-                    return {
-                        "status": "skipped",
-                        "reason": f"{firefighter_id} is already MOVING; "
-                                  f"new target only {dist_to_new:.1f}m away. "
-                                  f"Let it arrive first.",
-                        "firefighter_id": firefighter_id,
-                    }
-
-            # Safety net: snap on-fire targets to nearest perimeter cell
-            target_x, target_y, snapped = self_ref._snap_off_fire(
-                target_x, target_y)
-            if self_ref.on_assign_firefighter:
-                self_ref.on_assign_firefighter(firefighter_id, target_x, target_y)
-            result = {"status": "ok", "firefighter_id": firefighter_id,
-                      "target": [target_x, target_y]}
-            if snapped:
-                result["warning"] = "Target was on a burning cell; snapped to nearest safe cell."
-            return result
-
-        def refill_firefighter(firefighter_id: str) -> dict:
-            """Send a firefighter to the water supply at (0, 0) to refill its tank.
-
-            Use this when a firefighter's water_level is below 20.
-            The firefighter will stop spraying, navigate to the supply, refill,
-            and become IDLE once full.
-
-            Args:
-                firefighter_id: e.g. 'firefighter_1'.
-            """
-            if self_ref.on_refill_firefighter:
-                self_ref.on_refill_firefighter(firefighter_id)
-            return {
-                "status": "ok",
-                "firefighter_id": firefighter_id,
-                "target": self_ref.water_supply_position,
-                "note": "Firefighter is heading to water supply to refill.",
-            }
-
-        model_name = os.environ.get("ADK_MODEL", "gemini-2.5-flash-lite")
-
-        self.agent = Agent(
-            model=model_name,
-            name="scout_drone",
-            description="Aerial scout drone that monitors a wildfire and coordinates ground firefighters.",
-            instruction=SCOUT_INSTRUCTION,
-            tools=[
-                get_current_fov,
-                move_scout,
-                adjust_altitude,
-                get_fire_status,
-                get_fire_perimeter,
-                get_firefighter_positions,
-                assign_firefighter,
-                refill_firefighter,
-            ],
-        )
-
-        self._session_service = InMemorySessionService()
-        self._runner = InMemoryRunner(self.agent, app_name="wildfire_scout")
-        self._runner.session_service = self._session_service
-        self._session_id = 0
+        self._model_name = os.environ.get("ADK_MODEL", "gemini-2.5-flash-lite")
+        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        self._client = genai.Client(api_key=api_key)
 
     # -- public interface (called by ros_bridge timer) -----------------------
 
     async def run_analysis(self):
-        """Run one agentic analysis cycle.  The ADK agent will call tools
-        (get_current_fov, move_scout, adjust_altitude, assign_firefighter …)
-        in a multi-step loop until it is satisfied with coverage.
-        """
+        """One analysis cycle: reposition scout, call Gemini once, dispatch."""
         if self.fire_grid is None:
-            print("[SCOUT-ADK] No fire grid yet — skipping")
+            print("[SCOUT] No fire grid yet — skipping")
             return
 
-        self._session_id += 1
-        sid = f"analysis_{self._session_id}"
-
-        await self._session_service.create_session(
-            app_name="wildfire_scout",
-            user_id="system",
-            session_id=sid,
-        )
-
-        prompt = (
-            "Analyse your current field of view.  Make sure all fire and "
-            "all firefighters are visible.  Adjust your position or altitude "
-            "as needed, then assign firefighters to optimal positions."
-        )
-
-        content = Content(parts=[Part(text=prompt)])
-
-        final_text = ""
-        try:
-            async for event in self._runner.run_async(
-                new_message=content,
-                user_id="system",
-                session_id=sid,
-            ):
-                self._log_event(event)
-                if event.is_final_response() and event.content and event.content.parts:
-                    final_text = "".join(
-                        p.text for p in event.content.parts if getattr(p, "text", None)
-                    )
-        except Exception as exc:
-            print(f"[SCOUT-ADK] Agent run failed: {exc}")
+        fire_status = self._fire_status()
+        if fire_status["burning_cells"] == 0:
+            print("[SCOUT] No active fire — skipping")
             return
 
-        if final_text:
-            print(f"\n[SCOUT-ADK] === Final Summary ===\n{final_text}\n")
+        self._auto_position_scout(fire_status)
 
-    def _log_event(self, event):
-        """Print intermediate ADK events for visibility into scout reasoning."""
-        author = getattr(event, "author", "?")
+        perimeter = self._fire_perimeter()
+        ff_positions = self._get_firefighter_positions()
 
-        # Tool calls issued by the agent
-        calls = event.get_function_calls() if hasattr(event, "get_function_calls") else []
-        for call in calls:
-            args_pretty = json.dumps(
-                call.args if isinstance(call.args, dict) else str(call.args),
-                indent=2,
-            )
-            print(f"[SCOUT-ADK] Tool call: {call.name}(\n{args_pretty}\n)")
+        # Fast-path: handle obvious refills and idle assignments without LLM
+        # if all decisions are deterministic
+        assignments = self._try_deterministic_assignments(
+            fire_status, perimeter, ff_positions)
+        summary = None
 
-        # Tool responses
-        responses = event.get_function_responses() if hasattr(event, "get_function_responses") else []
-        for resp in responses:
-            data = resp.response
-            if isinstance(data, dict):
-                filtered = {k: v for k, v in data.items() if k != "fov_image_base64"}
-                pretty = json.dumps(filtered, indent=2)
+        if assignments is None:
+            assignments, summary = await self._call_gemini(
+                fire_status, perimeter, ff_positions)
+
+        self._execute_assignments(assignments, perimeter)
+
+        if summary:
+            print(f"[SCOUT] {summary}")
+
+    # -- deterministic scout positioning ------------------------------------
+
+    def _auto_position_scout(self, fire_status: dict):
+        """Move scout above fire centroid at altitude that covers all fire."""
+        centroid = fire_status.get("centroid")
+        bbox = fire_status.get("bounding_box")
+        if centroid is None or bbox is None:
+            return
+
+        cx, cy = centroid
+
+        fire_span = max(
+            bbox["max_x"] - bbox["min_x"],
+            bbox["max_y"] - bbox["min_y"],
+        )
+        margin = 5.0
+        required_radius = fire_span / 2.0 + margin
+
+        # Also ensure all firefighters are in FOV
+        for st in self.firefighter_status.values():
+            fx, fy = st["position"]
+            dist = math.hypot(fx - cx, fy - cy)
+            required_radius = max(required_radius, dist + 2.0)
+
+        required_alt = required_radius / math.tan(FOV_HALF_ANGLE_RAD)
+        z = max(MIN_ALTITUDE, min(MAX_ALTITUDE, required_alt))
+
+        self.scout_position = [cx, cy, z]
+        if self.on_move_scout:
+            self.on_move_scout(cx, cy, z)
+
+    # -- deterministic fast-path --------------------------------------------
+
+    def _try_deterministic_assignments(
+        self, fire_status, perimeter, ff_positions
+    ) -> Optional[list]:
+        """Return assignments list if all decisions are obvious, else None."""
+        if not self.firefighter_status:
+            return None
+
+        for st in self.firefighter_status.values():
+            if self._firefighter_in_danger(st["position"])[0]:
+                return None
+
+        perim_pts = perimeter.get("perimeter", [])
+        if not perim_pts and fire_status["burning_cells"] > 0:
+            return None
+
+        assignments = []
+        used_perimeter = set()
+
+        for ff_id, st in self.firefighter_status.items():
+            wl = st["water_level"]
+            state = st["state"]
+
+            if wl < REFILL_WATER_THRESHOLD:
+                assignments.append({
+                    "firefighter_id": ff_id, "action": "refill"})
+                continue
+
+            if state == "MOVING":
+                assignments.append({
+                    "firefighter_id": ff_id, "action": "hold"})
+                continue
+
+            if state == "FIGHTING":
+                fx, fy = st["position"]
+                still_near_fire = self._near_fire(fx, fy)
+                if still_near_fire:
+                    assignments.append({
+                        "firefighter_id": ff_id, "action": "hold"})
+                    continue
+                # Fire cleared — fall through to reassign
+
+            if state in ("IDLE", "FIGHTING", "REFILLING") and perim_pts:
+                best_idx = self._spread_pick_perimeter(
+                    ff_id, st["position"], perim_pts, used_perimeter)
+                if best_idx is not None:
+                    used_perimeter.add(best_idx)
+                    assignments.append({
+                        "firefighter_id": ff_id,
+                        "action": "move",
+                        "target": perim_pts[best_idx],
+                    })
+                    continue
+
+            # Can't decide deterministically
+            return None
+
+        return assignments
+
+    def _near_fire(self, x: float, y: float, radius: float = 3.0) -> bool:
+        n = self.grid_size
+        cs = self.cell_size
+        half = n * cs / 2.0
+        gx = int((x + half) / cs)
+        gy = int((y + half) / cs)
+        r_cells = int(radius / cs) + 1
+        for dy in range(-r_cells, r_cells + 1):
+            for dx in range(-r_cells, r_cells + 1):
+                nx, ny = gx + dx, gy + dy
+                if 0 <= nx < n and 0 <= ny < n:
+                    if self.fire_grid[ny * n + nx] > 0.1:
+                        return True
+        return False
+
+    def _spread_pick_perimeter(
+        self,
+        ff_id: str,
+        pos: tuple,
+        perimeter: list,
+        used: set,
+    ) -> Optional[int]:
+        """Pick a perimeter index that spreads agents around the fire (maximin from peers)."""
+        px, py = pos
+        others = [
+            st["position"]
+            for oid, st in self.firefighter_status.items()
+            if oid != ff_id
+        ]
+        best_i = None
+        best_key = None
+        for i, (wx, wy) in enumerate(perimeter):
+            if i in used:
+                continue
+            d_self = math.hypot(wx - px, wy - py)
+            if others:
+                d_sep = min(
+                    math.hypot(wx - ox, wy - oy) for ox, oy in others)
             else:
-                pretty = json.dumps(data, indent=2) if data is not None else str(data)
-            print(f"[SCOUT-ADK] Tool result: {resp.name} →\n{pretty}\n")
+                d_sep = float("inf")
+            # Prefer large separation; break ties with shorter travel.
+            key = (d_sep, -d_self)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_i = i
+        return best_i
 
-        # Intermediate reasoning text from the model
-        if (
-            not event.is_final_response()
-            and event.content
-            and event.content.parts
-            and author != "user"
-        ):
-            text = "".join(
-                p.text for p in event.content.parts if getattr(p, "text", None)
+    # -- single Gemini API call ---------------------------------------------
+
+    async def _call_gemini(self, fire_status, perimeter, ff_positions):
+        """One LLM call: state in → assignments out."""
+        ffs = ff_positions["firefighters"]
+        in_trouble = [
+            {
+                "firefighter_id": fid,
+                "position": data["position"],
+                "water_level": data["water_level"],
+                "state": data["state"],
+                "danger_reason": data.get("danger_reason"),
+            }
+            for fid, data in ffs.items()
+            if data.get("in_danger")
+        ]
+        state = {
+            "fire": fire_status,
+            "perimeter_positions": perimeter["perimeter"][:60],
+            "perimeter_count": perimeter["count"],
+            "firefighters": ffs,
+            "rescue": {
+                "active": len(in_trouble) > 0,
+                "units_in_danger": in_trouble,
+            },
+        }
+
+        prompt = ASSIGNMENT_PROMPT.format(state_json=json.dumps(state, indent=2))
+
+        print(f"[SCOUT] Calling Gemini ({self._model_name}) …")
+        try:
+            import asyncio
+            response = await asyncio.to_thread(
+                self._client.models.generate_content,
+                model=self._model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    max_output_tokens=900,
+                    temperature=0.1,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
             )
-            if text.strip() and not calls:
-                print(f"[SCOUT-ADK] Reasoning: {text.strip()}")
+            text = response.text.strip()
+            print(f"[SCOUT] Gemini response ({len(text)} chars)")
+
+            result = json.loads(text)
+            assignments = result.get("assignments", [])
+            summary = result.get("scout_summary", "")
+            return assignments, summary
+
+        except Exception as exc:
+            print(f"[SCOUT] Gemini call failed: {exc}")
+            return [], None
+
+    # -- execute assignments ------------------------------------------------
+
+    def _execute_assignments(self, assignments: list, perimeter: dict):
+        perim_pts = perimeter.get("perimeter", [])
+
+        for cmd in assignments:
+            ff_id = cmd.get("firefighter_id", "")
+            action = cmd.get("action", "hold")
+
+            if action == "hold":
+                continue
+
+            if action == "refill":
+                print(f"[SCOUT] {ff_id} → refill")
+                if self.on_refill_firefighter:
+                    self.on_refill_firefighter(ff_id)
+                continue
+
+            if action == "move":
+                target = cmd.get("target")
+                if not target or len(target) < 2:
+                    continue
+                tx, ty = float(target[0]), float(target[1])
+                tx, ty, snapped = self._snap_off_fire(tx, ty)
+                if snapped:
+                    print(f"[SCOUT] {ff_id} target snapped off fire → ({tx:.1f}, {ty:.1f})")
+                print(f"[SCOUT] {ff_id} → move ({tx:.1f}, {ty:.1f})")
+                if self.on_assign_firefighter:
+                    self.on_assign_firefighter(ff_id, tx, ty)
 
     # -- data setters (called by ros_bridge) ---------------------------------
 
@@ -357,7 +394,7 @@ class ScoutADKAgent:
         self.grid_size = grid_size
 
     def set_camera_image(self, image: np.ndarray):
-        pass  # ADK agent uses structured FOV, not raw camera images
+        pass
 
     def update_scout_position(self, x: float, y: float, z: float):
         self.scout_position = [x, y, z]
@@ -370,143 +407,62 @@ class ScoutADKAgent:
             "state": state,
         }
 
-    # -- FOV computation -----------------------------------------------------
+    # -- helpers (fire status, perimeter, snap) ------------------------------
 
-    def _compute_fov(self) -> dict:
-        """Render the conical FOV and return structured + image data."""
-        sx, sy, sz = self.scout_position
+    def _grid_indices(self, x: float, y: float) -> tuple[int, int]:
         n = self.grid_size
         cs = self.cell_size
         half = n * cs / 2.0
+        gx = int((x + half) / cs)
+        gy = int((y + half) / cs)
+        return gx, gy
 
-        fov_radius_world = sz * math.tan(FOV_HALF_ANGLE_RAD)
-        fov_radius_cells = fov_radius_world / cs
-
-        # fire stats
-        fire_cells_total = 0
-        fire_cells_in_fov = 0
-        fire_xs, fire_ys = [], []
-        all_fire_xs, all_fire_ys = [], []
-
-        for gy in range(n):
-            for gx in range(n):
-                val = self.fire_grid[gy * n + gx]
-                if val < 0.1:
-                    continue
-                fire_cells_total += 1
-                wx = (gx - n / 2.0 + 0.5) * cs
-                wy = (gy - n / 2.0 + 0.5) * cs
-                all_fire_xs.append(wx)
-                all_fire_ys.append(wy)
-                dist = math.hypot(wx - sx, wy - sy)
-                if dist <= fov_radius_world:
-                    fire_cells_in_fov += 1
-                    fire_xs.append(wx)
-                    fire_ys.append(wy)
-
-        fire_centroid = None
-        if all_fire_xs:
-            fire_centroid = [
-                sum(all_fire_xs) / len(all_fire_xs),
-                sum(all_fire_ys) / len(all_fire_ys),
-            ]
-        fire_clipped = fire_cells_in_fov < fire_cells_total
-
-        # firefighter visibility
-        ff_in_fov = []
-        for ff_id, st in self.firefighter_status.items():
-            fx, fy = st["position"]
-            if math.hypot(fx - sx, fy - sy) <= fov_radius_world:
-                ff_in_fov.append(ff_id)
-
-        # coverage stats
-        total_cells_in_fov = math.pi * fov_radius_cells ** 2
-        occupied = fire_cells_in_fov + len(ff_in_fov)
-        empty_pct = max(0.0, 1.0 - occupied / max(total_cells_in_fov, 1.0))
-        fire_cov = (fire_cells_in_fov / fire_cells_total * 100.0) if fire_cells_total else 100.0
-
-        # render FOV image
-        img_b64 = self._render_fov_image(sx, sy, fov_radius_world)
-
-        return {
-            "scout_x": round(sx, 2),
-            "scout_y": round(sy, 2),
-            "scout_z": round(sz, 2),
-            "fov_radius_cells": round(fov_radius_cells, 1),
-            "fire_cells_in_fov": fire_cells_in_fov,
-            "fire_cells_total": fire_cells_total,
-            "fire_coverage_pct": round(fire_cov, 1),
-            "fire_clipped": fire_clipped,
-            "fire_centroid": fire_centroid,
-            "firefighters_in_fov": ff_in_fov,
-            "firefighters_total": len(self.firefighter_status),
-            "empty_pct": round(empty_pct * 100, 1),
-            "fov_image_base64": img_b64,
-        }
-
-    def _render_fov_image(self, cx: float, cy: float, radius: float) -> str:
-        """Render a top-down grid image of the circular FOV region."""
+    def _cell_burning(self, gx: int, gy: int) -> bool:
+        if self.fire_grid is None:
+            return False
         n = self.grid_size
-        cs = self.cell_size
-        px = FOV_IMAGE_PX
-        half = n * cs / 2.0
+        if not (0 <= gx < n and 0 <= gy < n):
+            return False
+        return self.fire_grid[gy * n + gx] >= FIRE_CELL_THRESHOLD
 
-        img = np.full((px, px, 3), (20, 50, 20), dtype=np.uint8)
-
-        if radius < 0.01:
-            return self._img_to_b64(img)
-
-        for py_ in range(px):
-            for px_ in range(px):
-                # map pixel to world coords inside the FOV square
-                wx = cx + (px_ / px - 0.5) * 2.0 * radius
-                wy = cy + (py_ / px - 0.5) * 2.0 * radius
-                if math.hypot(wx - cx, wy - cy) > radius:
-                    img[py_, px_] = (10, 10, 10)
+    def _firefighter_in_danger(self, pos: tuple) -> tuple[bool, Optional[str]]:
+        """Stuck-in-fire heuristic: on fire, or tight ring of fire around cell."""
+        x, y = pos
+        gx, gy = self._grid_indices(x, y)
+        if self._cell_burning(gx, gy):
+            return True, "on_burning_cell"
+        burning_nb = 0
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
                     continue
-                gx = int((wx + half) / cs)
-                gy = int((wy + half) / cs)
-                if not (0 <= gx < n and 0 <= gy < n):
-                    img[py_, px_] = (10, 10, 10)
-                    continue
-                val = self.fire_grid[gy * n + gx]
-                if val > 0.1:
-                    r = min(255, int(val * 255))
-                    g = max(0, int((1.0 - val) * 60))
-                    img[py_, px_] = (r, g, 0)
+                if self._cell_burning(gx + dx, gy + dy):
+                    burning_nb += 1
+        if burning_nb >= 5:
+            return True, "surrounded_by_fire"
+        return False, None
 
-        # draw firefighters
+    def _get_firefighter_positions(self) -> dict:
+        out = {}
         for ff_id, st in self.firefighter_status.items():
-            fx, fy = st["position"]
-            if math.hypot(fx - cx, fy - cy) > radius:
-                continue
-            fpx = int(((fx - cx) / (2.0 * radius) + 0.5) * px)
-            fpy = int(((fy - cy) / (2.0 * radius) + 0.5) * px)
-            if 0 <= fpx < px and 0 <= fpy < px:
-                cv2.circle(img, (fpx, fpy), 4, (0, 255, 255), -1)
-
-        # crosshair at centre
-        cv2.drawMarker(img, (px // 2, px // 2), (255, 255, 255),
-                        cv2.MARKER_CROSS, 8, 1)
-
-        return self._img_to_b64(img)
-
-    @staticmethod
-    def _img_to_b64(img: np.ndarray) -> str:
-        _, buf = cv2.imencode(".png", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-        return base64.b64encode(buf.tobytes()).decode()
-
-    # -- fire status helper --------------------------------------------------
+            x, y = st["position"]
+            in_danger, reason = self._firefighter_in_danger((x, y))
+            out[ff_id] = {
+                "position": list(st["position"]),
+                "water_level": st["water_level"],
+                "state": st["state"],
+                "in_danger": in_danger,
+                "danger_reason": reason,
+            }
+        return {"firefighters": out, "total": len(out)}
 
     def _fire_status(self) -> dict:
         n = self.grid_size
         cs = self.cell_size
         burning = 0
         xs, ys = [], []
-        min_gx = n
-        max_gx = 0
-        min_gy = n
-        max_gy = 0
+        min_gx, max_gx = n, 0
+        min_gy, max_gy = n, 0
 
         for gy in range(n):
             for gx in range(n):
@@ -544,10 +500,7 @@ class ScoutADKAgent:
             "threat_level": threat,
         }
 
-    # -- fire perimeter helper ------------------------------------------------
-
     def _fire_perimeter(self) -> dict:
-        """Non-burning cells adjacent to at least one burning cell."""
         if self.fire_grid is None:
             return {"perimeter": [], "count": 0}
 
@@ -560,10 +513,10 @@ class ScoutADKAgent:
                 if self.fire_grid[gy * n + gx] < 0.1:
                     continue
                 for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    nx, ny = gx + dx, gy + dy
-                    if 0 <= nx < n and 0 <= ny < n:
-                        if self.fire_grid[ny * n + nx] < 0.1:
-                            perimeter_set.add((nx, ny))
+                    nx_, ny_ = gx + dx, gy + dy
+                    if 0 <= nx_ < n and 0 <= ny_ < n:
+                        if self.fire_grid[ny_ * n + nx_] < 0.1:
+                            perimeter_set.add((nx_, ny_))
 
         perimeter_world = []
         for gx, gy in perimeter_set:
@@ -574,7 +527,6 @@ class ScoutADKAgent:
         return {"perimeter": perimeter_world, "count": len(perimeter_world)}
 
     def _snap_off_fire(self, x: float, y: float) -> tuple[float, float, bool]:
-        """If (x, y) lands on a burning cell, snap to the nearest perimeter cell."""
         if self.fire_grid is None:
             return x, y, False
 
@@ -598,15 +550,12 @@ class ScoutADKAgent:
 
 
 # ---------------------------------------------------------------------------
-# Standalone entry point (for testing outside the bridge)
+# Standalone entry point
 # ---------------------------------------------------------------------------
 
 def main():
-    import asyncio as _aio
-    use_vlm = os.environ.get("USE_VLM", "true").lower() == "true"
-    scout = ScoutADKAgent(use_vlm=use_vlm)
-    # Without the bridge we can't do much; just verify construction.
-    print(f"[SCOUT-ADK] Agent created.  model={scout.agent.model}")
+    scout = ScoutADKAgent()
+    print(f"[SCOUT] Agent created. model={scout._model_name}")
 
 
 if __name__ == "__main__":

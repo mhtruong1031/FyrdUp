@@ -5,10 +5,11 @@ Firefighter uAgent — ground robot that receives commands from the scout.
 State machine: IDLE -> MOVING -> FIGHTING -> REFILLING -> IDLE
 """
 
+import queue
 import sys
 from uagents import Agent, Context
 
-from .models import MoveCommand, RefillCommand, StatusUpdate
+from .models import InFireAlert, MoveCommand, RefillCommand, StatusUpdate
 
 
 class FirefighterAgent:
@@ -32,6 +33,8 @@ class FirefighterAgent:
         self.on_move_command = None
         self.on_refill_command = None
 
+        self._in_fire_outbox: queue.Queue = queue.Queue(maxsize=4)
+
         self._setup_handlers()
 
     def _setup_handlers(self):
@@ -48,6 +51,25 @@ class FirefighterAgent:
                 await ctx.send(self.scout_address, status)
             except Exception:
                 pass  # scout may not have a uAgent endpoint
+
+        @self.agent.on_interval(period=0.25)
+        async def drain_in_fire_alerts(ctx: Context):
+            while True:
+                try:
+                    reason = self._in_fire_outbox.get_nowait()
+                except queue.Empty:
+                    break
+                alert = InFireAlert(
+                    firefighter_id=self.firefighter_id,
+                    position=self.position,
+                    water_level=self.water_level,
+                    state=self.state,
+                    reason=reason,
+                )
+                try:
+                    await ctx.send(self.scout_address, alert)
+                except Exception:
+                    pass
 
         @self.agent.on_message(model=MoveCommand)
         async def handle_move(ctx: Context, sender: str, msg: MoveCommand):
@@ -90,6 +112,13 @@ class FirefighterAgent:
 
     def update_state(self, state: str):
         self.state = state
+
+    def enqueue_in_fire_alert(self, reason: str = "on_burning_cell"):
+        """Thread-safe: ROS bridge enqueues; uAgent interval sends to scout."""
+        try:
+            self._in_fire_outbox.put_nowait(reason)
+        except queue.Full:
+            pass
 
     def run(self):
         self.agent.run()

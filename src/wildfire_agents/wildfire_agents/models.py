@@ -22,3 +22,13 @@ class StatusUpdate(Model):
     position: Tuple[float, float]
     water_level: float
     state: str  # IDLE, MOVING, FIGHTING, REFILLING
+
+
+class InFireAlert(Model):
+    """Immediate ping: firefighter's grid cell is burning (needs rescue / replan)."""
+
+    firefighter_id: str
+    position: Tuple[float, float]
+    water_level: float
+    state: str
+    reason: str  # e.g. on_burning_cell

@@ -23,6 +23,8 @@ from nav_msgs.msg import Odometry
 from wildfire_msgs.msg import FireGrid
 from cv_bridge import CvBridge
 
+from .viz_colors import FIRE_DRAW_THRESHOLD, fire_cell_bgr
+
 PX_PER_CELL = 16
 
 
@@ -79,14 +81,12 @@ class FoxgloveViz(Node):
         for y in range(n):
             for x in range(n):
                 val = msg.intensity[y * n + x]
-                if val > 0.01:
+                if val > FIRE_DRAW_THRESHOLD:
                     burning_count += 1
                     total_intensity += val
-                    r = min(255, int(val * 255))
-                    g = max(0, int((1.0 - val) * 80))
                     y0, y1 = y * px + 1, (y + 1) * px - 1
                     x0, x1 = x * px + 1, (x + 1) * px - 1
-                    img[y0:y1, x0:x1] = (r, g, 0)
+                    img[y0:y1, x0:x1] = fire_cell_bgr(val)
 
         for i in range(n):
             img[i * px, :] = (60, 60, 60)
@@ -94,7 +94,7 @@ class FoxgloveViz(Node):
 
         cx = (n // 2) * px + px // 2
         cy = (n // 2) * px + px // 2
-        cv2.rectangle(img, (cx - 8, cy - 8), (cx + 8, cy + 8), (255, 180, 50), -1)
+        cv2.rectangle(img, (cx - 8, cy - 8), (cx + 8, cy + 8), (50, 140, 255), -1)
         cv2.rectangle(img, (cx - 8, cy - 8), (cx + 8, cy + 8), (255, 255, 255), 1)
 
         for ff_id, (fx, fy) in self.ff_positions.items():
@@ -105,12 +105,13 @@ class FoxgloveViz(Node):
                 cv2.circle(img, center, 8, (0, 255, 255), -1)
                 cv2.circle(img, center, 8, (255, 255, 255), 1)
 
-        ros_img = self.bridge.cv2_to_imgmsg(img, encoding='rgb8')
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        ros_img = self.bridge.cv2_to_imgmsg(rgb, encoding='rgb8')
         ros_img.header.stamp = self.get_clock().now().to_msg()
         ros_img.header.frame_id = 'viz'
         self.image_pub.publish(ros_img)
 
-        _, png_buf = cv2.imencode('.png', cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        _, png_buf = cv2.imencode('.png', img)
         foxglove.log('/viz/fire_image', fgs.CompressedImage(
             data=png_buf.tobytes(),
             format='png',

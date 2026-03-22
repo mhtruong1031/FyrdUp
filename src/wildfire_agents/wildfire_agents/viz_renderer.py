@@ -22,6 +22,8 @@ from nav_msgs.msg import Odometry
 from wildfire_msgs.msg import FireGrid
 from cv_bridge import CvBridge
 
+from .viz_colors import FIRE_DRAW_THRESHOLD, fire_cell_bgr
+
 PX_PER_CELL = 32
 
 
@@ -69,18 +71,16 @@ class VizRenderer(Node):
         px = PX_PER_CELL
         size = n * px
 
-        # Dark green background (unburned terrain)
+        # BGR image (OpenCV); convert to rgb8 for ROS / VLM.
         img = np.full((size, size, 3), (34, 85, 34), dtype=np.uint8)
 
         for y in range(n):
             for x in range(n):
                 val = msg.intensity[y * n + x]
-                if val > 0.01:
-                    r = min(255, int(val * 255))
-                    g = max(0, int((1.0 - val) * 80))
+                if val > FIRE_DRAW_THRESHOLD:
                     y0, y1 = y * px + 1, (y + 1) * px - 1
                     x0, x1 = x * px + 1, (x + 1) * px - 1
-                    img[y0:y1, x0:x1] = (r, g, 0)
+                    img[y0:y1, x0:x1] = fire_cell_bgr(val)
 
         # Grid lines
         for i in range(n + 1):
@@ -89,28 +89,28 @@ class VizRenderer(Node):
                 img[coord, :] = (60, 60, 60)
                 img[:, coord] = (60, 60, 60)
 
-        # Water supply at grid center
+        # Water supply at grid center (BGR)
         cx = (n // 2) * px + px // 2
         cy = (n // 2) * px + px // 2
         half = 10
         cv2.rectangle(img, (cx - half, cy - half), (cx + half, cy + half),
-                       (255, 180, 50), -1)
+                       (50, 140, 255), -1)
         cv2.rectangle(img, (cx - half, cy - half), (cx + half, cy + half),
                        (255, 255, 255), 1)
 
-        # Firefighter positions (yellow circles)
+        # Firefighter positions (yellow / low-water orange in BGR)
         for ff_id, (fx, fy) in self.ff_positions.items():
             gx = int(fx + n / 2.0)
             gy = int(fy + n / 2.0)
             if 0 <= gx < n and 0 <= gy < n:
                 center = (gx * px + px // 2, gy * px + px // 2)
                 water_pct = self.ff_water.get(ff_id, 100.0)
-                color = (0, 255, 255) if water_pct > 20 else (0, 100, 255)
+                color = (0, 255, 255) if water_pct > 20 else (0, 128, 255)
                 cv2.circle(img, center, 8, color, -1)
                 cv2.circle(img, center, 8, (255, 255, 255), 1)
 
-        # Publish as ROS Image
-        ros_img = self.bridge.cv2_to_imgmsg(img, encoding='rgb8')
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        ros_img = self.bridge.cv2_to_imgmsg(rgb, encoding='rgb8')
         ros_img.header.stamp = self.get_clock().now().to_msg()
         ros_img.header.frame_id = 'viz'
         self.image_pub.publish(ros_img)

@@ -60,6 +60,7 @@ TREE_SEED = 12345
 ROCK_COUNT = 30
 ROCK_SEED = 67890
 FRAME_ID = 'world'
+FOV_HALF_ANGLE_RAD = math.radians(35.0)
 
 
 class ScenePublisher3D(Node):
@@ -333,10 +334,14 @@ class ScenePublisher3D(Node):
                 gz = float(self._terrain_h[gy, gx]) if gy < self._grid_size and gx < self._grid_size else 0.0
                 fire_h = max(0.05, val * 2.0)
 
+                # Red-dominant fire (avoid green at low intensity — matches bird's-eye viz)
+                fr = min(1.0, 0.38 + 0.62 * (val ** 0.55))
+                fg = min(0.88, 0.06 + 0.28 * val + 0.42 * val * val)
+                fb = min(0.22, 0.04 + 0.10 * val * val * val)
                 fire_cubes.append(fgs.CubePrimitive(
                     pose=_fg_pose(wx, wy, gz + fire_h / 2.0),
                     size=_fg_vec3(cs * 0.9, cs * 0.9, fire_h),
-                    color=_fg_color(1.0, max(0.0, 0.6 * (1.0 - val)), 0.0, 0.65 + 0.30 * val),
+                    color=_fg_color(fr, fg, fb, 0.65 + 0.30 * val),
                 ))
 
         # burning tree canopies
@@ -349,10 +354,13 @@ class ScenePublisher3D(Node):
             if val < 0.05:
                 continue
             trunk_h, canopy_r = self._tree_data[i]
+            tr = min(1.0, 0.25 + 0.75 * val)
+            tg = min(0.7, 0.12 * val + 0.45 * val * val)
+            tb = 0.04 * val
             burn_spheres.append(fgs.SpherePrimitive(
                 pose=_fg_pose(wx, wy, gz + trunk_h + canopy_r * 0.6),
                 size=_fg_vec3(canopy_r * 2.2, canopy_r * 2.2, canopy_r * 1.8),
-                color=_fg_color(0.9 * val + 0.1, 0.3 * (1.0 - val), 0.0, 0.8),
+                color=_fg_color(tr, tg, tb, 0.8),
             ))
 
         fire_entity = fgs.SceneEntity(
@@ -361,6 +369,35 @@ class ScenePublisher3D(Node):
             cubes=fire_cubes, spheres=burn_spheres,
         )
         foxglove.log('/scene', fgs.SceneUpdate(entities=[fire_entity]))
+
+    # -----------------------------------------------------------------------
+    # Scout FOV perimeter
+    # -----------------------------------------------------------------------
+
+    def _build_fov_perimeter_cubes(self):
+        """Return cube primitives for grid cells on the scout FOV circle edge."""
+        sx, sy, sz = self._scout_pos
+        sz = max(sz, 5.0)
+        fov_radius = sz * math.tan(FOV_HALF_ANGLE_RAD)
+
+        n = self._grid_size
+        cs = self._cell_size
+        half_cs = cs * 0.5
+
+        cubes = []
+        for gy in range(n):
+            for gx in range(n):
+                wx = (gx - n / 2.0 + 0.5) * cs
+                wy = (gy - n / 2.0 + 0.5) * cs
+                dist = math.hypot(wx - sx, wy - sy)
+                if fov_radius - half_cs <= dist <= fov_radius + half_cs:
+                    gz = float(self._terrain_h[gy, gx])
+                    cubes.append(fgs.CubePrimitive(
+                        pose=_fg_pose(wx, wy, gz + 0.06),
+                        size=_fg_vec3(cs * 0.98, cs * 0.98, 0.12),
+                        color=_fg_color(0.2, 0.4, 1.0, 0.5),
+                    ))
+        return cubes
 
     # -----------------------------------------------------------------------
     # Robot markers (5 Hz)
@@ -424,7 +461,16 @@ class ScenePublisher3D(Node):
             lifetime=fgs.Duration(sec=1, nsec=0),
             cubes=cubes, cylinders=cylinders, texts=texts,
         )
-        foxglove.log('/scene', fgs.SceneUpdate(entities=[robot_entity]))
+
+        # Scout FOV perimeter — blue translucent tiles on the ring edge
+        fov_cubes = self._build_fov_perimeter_cubes()
+        fov_entity = fgs.SceneEntity(
+            timestamp=ts, frame_id=FRAME_ID, id='fov_perimeter',
+            lifetime=fgs.Duration(sec=1, nsec=0),
+            cubes=fov_cubes,
+        )
+
+        foxglove.log('/scene', fgs.SceneUpdate(entities=[robot_entity, fov_entity]))
 
 
 def main(args=None):
