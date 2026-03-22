@@ -15,6 +15,7 @@ import math
 import os
 import threading
 import time
+from urllib.parse import quote
 
 import nest_asyncio
 import rclpy
@@ -32,6 +33,38 @@ SPRAY_RANGE = 3.0  # metres — must match fire_grid_node spray_range
 FIRE_THRESHOLD = 0.1
 # Re-ping scout via uAgent while still on a burning cell (seconds)
 IN_FIRE_UAGENT_PING_COOLDOWN_S = 12.0
+
+
+def _local_agent_inspector_url(agent) -> str:
+    """
+    Agentverse Local Agent Inspector URL for a running uAgent (same shape as
+    framework logs). Requires uAgents 0.18+ so the local HTTP server exposes
+    inspector routes; 0.11 only had /submit and the web UI could not attach.
+    """
+    av = agent.agentverse
+    if isinstance(av, dict):
+        base = f"{av['http_prefix']}://{av['base_url']}".rstrip('/')
+    else:
+        base = getattr(av, 'url', None) or 'https://agentverse.ai'
+        base = str(base).rstrip('/')
+    port = getattr(agent, '_port', None)
+    if port is None:
+        port = 8000
+    uri = quote(f'http://127.0.0.1:{port}')
+    return f'{base}/inspect/?uri={uri}&address={agent.address}'
+
+
+def _save_inspector_links_file(path: str, scout_uagent, firefighter_agents: dict) -> None:
+    """Write Local Agent Inspector URLs to a text file (one label + URL per line)."""
+    lines = [
+        '# Local Agent Inspector (uAgents) — open these URLs in your browser',
+        '',
+        f'scout: {_local_agent_inspector_url(scout_uagent.agent)}',
+    ]
+    for ff_id, ff in firefighter_agents.items():
+        lines.append(f'{ff_id}: {_local_agent_inspector_url(ff.agent)}')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
 
 
 class ROSBridge(Node):
@@ -524,6 +557,15 @@ def main(args=None):
         threading.Thread(
             target=_run_agent, args=(ff,), daemon=True).start()
         print(f'[BRIDGE] {ff_id} uAgent thread started')
+
+    links_path = os.environ.get(
+        'UAGENT_INSPECTOR_LINKS_FILE', 'uagent_inspector_links.txt')
+    try:
+        _save_inspector_links_file(links_path, scout_uagent, firefighter_agents)
+        print(
+            f'[BRIDGE] Inspector links saved to {os.path.abspath(links_path)}')
+    except OSError as exc:
+        print(f'[BRIDGE] Could not write inspector links file ({exc!r})')
 
     print('[BRIDGE] All agents running. Spinning ROS bridge...')
 

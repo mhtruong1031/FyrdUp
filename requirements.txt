@@ -1,4 +1,4 @@
-uagents==0.11.0
+uagents>=0.24.0,<0.25
 opencv-python>=4.8.0
 numpy>=1.24.0
 google-generativeai>=0.8.0
@@ -11,6 +11,4 @@ pyyaml>=6.0
 transformers>=4.35.0
 torch>=2.1.0
 Pillow>=10.0.0
-# NOTE: google-adk needs pydantic>=2, uagents pins pydantic<2.
-# Install order: pip install uagents==0.11.0 && pip install google-adk pydantic>=2 --force-reinstall --no-deps-check
-# uagents works with pydantic v2 for simple Model subclasses.
+# uagents 0.24+ requires pydantic>=2.8 (aligned with google-adk).

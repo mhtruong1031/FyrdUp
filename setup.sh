@@ -45,7 +45,22 @@ echo "✓ Python $PYTHON_VERSION detected"
 
 echo ""
 echo "Installing Python dependencies..."
-pip3 install -r requirements.txt
+
+# PEP 668: Homebrew / system Python ships an "externally-managed" marker and
+# refuses `pip install` outside a venv. Use conda (ros2) or a venv first.
+if python3 -c "import pathlib, sys; sys.exit(0 if (pathlib.Path(sys.prefix) / 'externally-managed').exists() else 1)"; then
+    echo ""
+    echo "Error: this Python is externally managed (PEP 668) — pip cannot install here."
+    echo "  On macOS with Homebrew Python, activate your ROS conda env first, then re-run:"
+    echo "    conda activate ros2"
+    echo "    ./setup.sh"
+    echo "  Or use a venv:"
+    echo "    python3 -m venv .venv && source .venv/bin/activate"
+    echo "    pip install -r requirements.txt"
+    exit 1
+fi
+
+python3 -m pip install -r requirements.txt
 
 # --- Google API key (optional) ------------------------------------------------
 

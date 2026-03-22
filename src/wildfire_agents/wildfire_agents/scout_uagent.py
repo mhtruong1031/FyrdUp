@@ -6,6 +6,11 @@ Provides a real uAgent identity (port 8000) so firefighter uAgents can send
 StatusUpdate and InFireAlert messages to the scout, and the bridge can dispatch
 MoveCommand / RefillCommand messages to firefighters via the uAgent protocol.
 
+By default the scout registers with an **Agentverse mailbox** URL (see
+``SCOUT_UAGENT_MAILBOX``) so the agent is visible/discoverable there while the
+local HTTP server still runs (uAgents keeps the server when REST/inspector
+handlers exist).
+
 All ADK intelligence lives in scout_agent.py — this module only handles
 uAgent message plumbing.
 """
@@ -17,6 +22,7 @@ from uagents import Agent, Context
 from typing import Callable, Optional
 
 from .models import InFireAlert, MoveCommand, RefillCommand, StatusUpdate
+from .uagent_env import env_flag
 
 
 class ScoutUAgent:
@@ -24,10 +30,12 @@ class ScoutUAgent:
     def __init__(self, adk_agent, port: int = 8000, seed: str = "scout_drone_seed"):
         self.adk_agent = adk_agent
         self.on_in_fire_alert: Optional[Callable] = None
+        use_mailbox = env_flag('SCOUT_UAGENT_MAILBOX', True)
         self.agent = Agent(
             name="scout_drone_uagent",
             port=port,
             seed=seed,
+            mailbox=use_mailbox,
         )
         self._ff_addresses: dict[str, str] = {}
         self._outbox: queue.Queue = queue.Queue()

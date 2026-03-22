@@ -4,6 +4,7 @@ install/
 log/
 
 # Python
+.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -12,6 +13,9 @@ dist/
 
 # Logs
 logs/
+
+# Generated at ros_bridge startup (Local Agent Inspector URLs)
+uagent_inspector_links.txt
 
 # Environment
 .env

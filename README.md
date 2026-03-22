@@ -100,7 +100,12 @@ source install/setup.bash
 
 ### Manual setup (same as above without the script)
 
+On **macOS**, Homebrew’s default `python3` is [PEP 668](https://peps.python.org/pep-0668/) “externally managed,” so plain `pip install` fails. Activate your **conda ROS env** (e.g. `conda activate ros2`) or a **venv** before installing.
+
 ```bash
+# macOS: conda (matches run_sim.sh) or: python3 -m venv .venv && source .venv/bin/activate
+conda activate ros2
+
 pip install -r requirements.txt
 
 # Linux
@@ -122,7 +127,7 @@ source install/setup.bash
 
 ### Python dependencies note
 
-`requirements.txt` pins `uagents` and pulls in **google-adk** (needs **pydantic v2**). If `pip` reports a conflict, follow the comment at the bottom of `requirements.txt` (install order / `--force-reinstall` for `google-adk` and pydantic). First run also downloads **Depth Anything V2** weights via Hugging Face — expect a large download and GPU/CPU time.
+`requirements.txt` pins **uagents 0.24+** and **google-adk** (both use **pydantic v2**). First run also downloads **Depth Anything V2** weights via Hugging Face — expect a large download and GPU/CPU time.
 
 ### Optional: `run_sim.sh` (developer convenience)
 
@@ -135,6 +140,8 @@ source install/setup.bash
 | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | Gemini (fire shape from image, scout assignments) |
 | `WILDFIRE_IMAGE_PATH` | Aerial image for Depth Anything + VLM fire mask (default: `wildfire.png` in repo root) |
 | `NUM_FIREFIGHTERS` | Set by launch; number of firefighter uAgents (`8001` …) |
+| `SCOUT_UAGENT_MAILBOX` | `true` (default): scout registers with **Agentverse mailbox** for visibility; `false` for local-only scout (no mailbox polling) |
+| `FIREFIGHTER_UAGENT_MAILBOX` | `true` (default): each firefighter uAgent uses **Agentverse mailbox**; `false` for local-only firefighters |
 | `USE_VLM` | Passed through to the scout stack (`use_vlm` launch arg) |
 | `ADK_MODEL` | Override Gemini model for the scout tactical / JSON step (default `gemini-2.5-flash-lite`) |
 | `REASONING_MODEL` | Gemini model for the **fast** streaming commentary loop (default `gemini-2.5-flash-lite`) |

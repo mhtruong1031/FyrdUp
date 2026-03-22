@@ -3,6 +3,9 @@
 Firefighter uAgent — ground robot that receives commands from the scout.
 
 State machine: IDLE -> MOVING -> FIGHTING -> REFILLING -> IDLE
+
+By default registers with an **Agentverse mailbox** (``FIREFIGHTER_UAGENT_MAILBOX``)
+like the scout, for visibility on Agentverse.
 """
 
 import queue
@@ -10,16 +13,19 @@ import sys
 from uagents import Agent, Context
 
 from .models import InFireAlert, MoveCommand, RefillCommand, StatusUpdate
+from .uagent_env import env_flag
 
 
 class FirefighterAgent:
 
     def __init__(self, firefighter_id: str, port: int, scout_address: str):
         self.firefighter_id = firefighter_id
+        use_mailbox = env_flag('FIREFIGHTER_UAGENT_MAILBOX', True)
         self.agent = Agent(
             name=firefighter_id,
             port=port,
             seed=f'{firefighter_id}_seed',
+            mailbox=use_mailbox,
         )
         self.scout_address = scout_address
 
