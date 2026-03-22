@@ -8,7 +8,9 @@ scout uAgent protocol; ROS topics drive the Gazebo simulation.
 """
 
 import asyncio
+import json
 import logging
+from typing import Optional
 import math
 import os
 import threading
@@ -16,10 +18,11 @@ import time
 
 import nest_asyncio
 import rclpy
+import yaml
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Point
-from std_msgs.msg import Bool, Float32
+from std_msgs.msg import Bool, Float32, String
 from nav_msgs.msg import Odometry
 from wildfire_msgs.msg import FireGrid
 from cv_bridge import CvBridge
@@ -53,6 +56,9 @@ class ROSBridge(Node):
         self._ff_on_burning_cell_prev: dict[str, bool] = {}
         self._ff_last_in_fire_ping_mono: dict[str, float] = {}
 
+        self._reasoning_running = False
+        self._last_reasoning_pub_payload: Optional[str] = None
+
         # Bird's-eye image from viz_renderer (kept for compatibility)
         self.create_subscription(
             Image, '/viz/fire_image', self._camera_cb, 10)
@@ -68,6 +74,14 @@ class ROSBridge(Node):
         # Scout target position publisher (ADK agent's move_scout tool)
         self.scout_target_pub = self.create_publisher(
             Point, '/scout/target_position', 10)
+
+        self.scout_reasoning_pub = self.create_publisher(
+            String, '/scout/reasoning_status', 10)
+        self.scout_decision_pub = self.create_publisher(
+            String, '/scout/decision_snapshot', 10)
+
+        self._reasoning_enabled = (
+            os.environ.get('REASONING_ENABLED', 'true').lower() == 'true')
 
         # Per-firefighter subscriptions and publishers
         self.target_position_pubs = {}
@@ -102,11 +116,21 @@ class ROSBridge(Node):
         self.scout_agent.on_move_scout = self._handle_scout_move
         self.scout_agent.on_assign_firefighter = self._handle_assign_firefighter
         self.scout_agent.on_refill_firefighter = self._handle_refill_firefighter
+        self.scout_agent.on_decision_snapshot = self._publish_decision_snapshot
         scout_uagent.on_in_fire_alert = self._on_in_fire_uagent_alert
 
-        # Periodic ADK analysis timer
+        # Periodic ADK analysis timer (slow loop)
         interval = scout_agent.analysis_interval
         self.create_timer(interval, self._trigger_analysis)
+
+        if self._reasoning_enabled:
+            r_int = max(1.0, float(scout_agent.reasoning_interval))
+            self.create_timer(r_int, self._trigger_reasoning)
+            self.get_logger().info(
+                f'[BRIDGE] Fast reasoning loop every {r_int}s')
+
+        # Throttled ROS mirror of reasoning buffer for Foxglove (2–4 Hz)
+        self.create_timer(0.3, self._publish_reasoning_status_tick)
 
         self.get_logger().info(
             f'[BRIDGE] Ready — ADK scout, '
@@ -357,6 +381,55 @@ class ROSBridge(Node):
         finally:
             self._analysis_running = False
 
+    # -- fast reasoning loop -------------------------------------------------
+
+    def _trigger_reasoning(self):
+        if not self._reasoning_enabled:
+            return
+        if self._reasoning_running:
+            self.get_logger().debug(
+                '[BRIDGE] Scout reasoning still running — skipping')
+            return
+        self._reasoning_running = True
+        threading.Thread(
+            target=self._run_reasoning_thread, daemon=True).start()
+
+    def _run_reasoning_thread(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            nest_asyncio.apply(loop)
+            loop.run_until_complete(
+                asyncio.wait_for(
+                    self.scout_agent.run_reasoning_stream(), timeout=90.0)
+            )
+        except asyncio.TimeoutError:
+            print('[BRIDGE] Scout reasoning timed out (90s)')
+        except Exception as exc:
+            print(f'[BRIDGE] Scout reasoning error: {exc}')
+        finally:
+            self._reasoning_running = False
+
+    def _publish_reasoning_status_tick(self):
+        d = self.scout_agent.get_reasoning_status_dict()
+        try:
+            js = json.dumps(d, default=str)
+        except (TypeError, ValueError):
+            return
+        streaming = d.get('streaming')
+        if js == self._last_reasoning_pub_payload and not streaming:
+            return
+        self._last_reasoning_pub_payload = js
+        self.scout_reasoning_pub.publish(String(data=js))
+
+    def _publish_decision_snapshot(self, payload: dict):
+        try:
+            self.scout_decision_pub.publish(
+                String(data=json.dumps(payload, default=str)))
+        except (TypeError, ValueError) as exc:
+            self.get_logger().error(
+                f'[BRIDGE] decision snapshot JSON error: {exc}')
+
 
 def _run_agent(agent):
     """Run a uAgent in a fresh event loop on its own daemon thread."""
@@ -364,6 +437,27 @@ def _run_agent(agent):
     asyncio.set_event_loop(loop)
     nest_asyncio.apply(loop)
     agent.run()
+
+
+def _load_agent_params() -> dict:
+    """Load ``analysis_interval`` / ``reasoning_interval`` from package YAML."""
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        share = get_package_share_directory('wildfire_agents')
+        path = os.path.join(share, 'config', 'agent_config.yaml')
+        with open(path, encoding='utf-8') as f:
+            cfg = yaml.safe_load(f) or {}
+        ros = (cfg.get('ros_bridge') or {}).get('ros__parameters') or {}
+        return {
+            'analysis_interval': float(ros.get('analysis_interval', 20.0)),
+            'reasoning_interval': float(ros.get('reasoning_interval', 5.0)),
+        }
+    except Exception as exc:
+        print(f'[BRIDGE] agent_config.yaml not loaded ({exc!r}) — using defaults')
+        return {
+            'analysis_interval': 20.0,
+            'reasoning_interval': 5.0,
+        }
 
 
 def main(args=None):
@@ -379,12 +473,26 @@ def main(args=None):
     num_firefighters = int(os.environ.get('NUM_FIREFIGHTERS', '4'))
     use_vlm = os.environ.get('USE_VLM', 'true').lower() == 'true'
 
+    params = _load_agent_params()
+    analysis_interval = float(os.environ.get(
+        'ANALYSIS_INTERVAL', params['analysis_interval']))
+    reasoning_interval = float(os.environ.get(
+        'REASONING_INTERVAL', params['reasoning_interval']))
+
     print(f'[BRIDGE] Starting with NUM_FIREFIGHTERS={num_firefighters} '
           f'USE_VLM={use_vlm}')
 
     # ADK scout (no uAgent, no port)
-    scout_agent = ScoutADKAgent(use_vlm=use_vlm)
-    print(f'[BRIDGE] ADK Scout agent created')
+    scout_agent = ScoutADKAgent(
+        use_vlm=use_vlm,
+        analysis_interval=analysis_interval,
+        reasoning_interval=reasoning_interval,
+    )
+    print(
+        f'[BRIDGE] ADK Scout agent created '
+        f'(analysis_interval={analysis_interval}s, '
+        f'reasoning_interval={reasoning_interval}s)'
+    )
 
     # Scout uAgent wrapper (messaging layer around the ADK agent)
     scout_uagent = ScoutUAgent(adk_agent=scout_agent)

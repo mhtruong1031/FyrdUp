@@ -1,6 +1,6 @@
-# Wildfire — uAgents, Google ADK & Gemini, ROS 2 & Gazebo Harmonic
+# FyrdUp — uAgents, Google ADK & Gemini, ROS 2 & Gazebo Harmonic
 
-Multi-agent wildfire simulation for **BeachHacks 2026**: a **scout** coordinates **N firefighter** ground robots using **Fetch uAgents**, a **Google ADK** scout agent, and **Gemini** for vision-driven fire initialization and tactical assignment. Physics and terrain run in **Gazebo Harmonic**; fire spread is simulated on a ROS 2 grid and visualized in **Foxglove Studio** via embedded **foxglove-sdk** WebSocket servers.
+Multi-agent wildfire simulation + framework for **BeachHacks 2026**: a **scout** coordinates **N firefighter** ground robots using **Fetch uAgents**, a **Google ADK** scout agent, and **Gemini** for vision-driven fire initialization and tactical assignment. Physics and terrain run in **Gazebo Harmonic**; fire spread is simulated on a ROS 2 grid and visualized in **Foxglove Studio** via embedded **foxglove-sdk** WebSocket servers.
 
 ![Reference aerial image used for terrain & fire initialization](wildfire.png)
 
@@ -11,7 +11,7 @@ Multi-agent wildfire simulation for **BeachHacks 2026**: a **scout** coordinates
 | **Gazebo Harmonic** | Headless world (`gz sim -s -r`), local install on the host |
 | **ROS 2 Humble** | Topics for grid, odometry, cmd_vel, water, bridge |
 | **Fetch uAgents** | Scout + firefighter messaging (`MoveCommand`, `RefillCommand`, alerts) |
-| **Google ADK + Gemini** | `ScoutADKAgent`: deterministic fast-path + JSON assignments from Gemini when needed |
+| **Google ADK + Gemini** | `ScoutADKAgent`: **fast** streaming commentary + **slow** tactical cycle (deterministic or JSON assignments); slow loop may reference the live reasoning text |
 | **VLM + depth** | Gemini labels fire shape from `wildfire.png`; **Depth Anything V2** builds a heightmap (PyTorch) |
 
 ## Architecture
@@ -48,7 +48,7 @@ Visualization does **not** use `ros-humble-foxglove-bridge`. Two **foxglove-sdk*
 | Port | Node | Purpose |
 |------|------|---------|
 | **8765** | `foxglove_viz` | Bird’s-eye `/viz/fire_image`, stats, agent status |
-| **8766** | `scene_publisher_3d` | 3D `SceneUpdate` on `/scene`, `FrameTransform` on `/tf` |
+| **8766** | `scene_publisher_3d` | 3D `SceneUpdate` on `/scene`, `FrameTransform` on `/tf`, typed **`foxglove.Log`** on **`/scout_fast_reasoning`** (fast loop) and **`/scout_slow_reasoning`** (slow loop) |
 
 Open **two** Foxglove WebSocket connections (`ws://localhost:8765` and `ws://localhost:8766`) to see 2D and 3D together. For the 3D panel, set **Fixed frame** to `world`.
 
@@ -136,7 +136,12 @@ source install/setup.bash
 | `WILDFIRE_IMAGE_PATH` | Aerial image for Depth Anything + VLM fire mask (default: `wildfire.png` in repo root) |
 | `NUM_FIREFIGHTERS` | Set by launch; number of firefighter uAgents (`8001` …) |
 | `USE_VLM` | Passed through to the scout stack (`use_vlm` launch arg) |
-| `ADK_MODEL` | Override Gemini model for the scout (default `gemini-2.5-flash-lite`) |
+| `ADK_MODEL` | Override Gemini model for the scout tactical / JSON step (default `gemini-2.5-flash-lite`) |
+| `REASONING_MODEL` | Gemini model for the **fast** streaming commentary loop (default `gemini-2.5-flash-lite`) |
+| `REASONING_INTERVAL` | Seconds between fast-loop Gemini calls (default from `agent_config.yaml`, else `5`) |
+| `REASONING_ENABLED` | `true` / `false` — disable the fast loop for offline demos (default `true`) |
+| `ANALYSIS_INTERVAL` | Seconds between slow `run_analysis` cycles (default from `agent_config.yaml` `analysis_interval`) |
+| `SLOW_LOOP_REASONING_WINDOW_SEC` | How many seconds of fast-loop commentary the **slow** tactical Gemini call may see (default `10`) |
 
 You can place keys in a **`.env`** file in the repo root and `source` it before launch (do **not** commit secrets).
 
@@ -171,10 +176,11 @@ If Gemini is unavailable at startup, `fire_grid_node` falls back to a **circular
 ### Foxglove Studio
 
 1. Open Foxglove → **Open connection** → **Foxglove WebSocket** → `ws://localhost:8765` (2D + status).
-2. Add another connection → `ws://localhost:8766` (3D scene).
+2. Add another connection → `ws://localhost:8766` (3D scene — same server as `/scene`).
 3. Add a **3D** panel, **Fixed frame** `world`, subscribe to `/scene` on the **8766** connection.
+4. **Scout fast / slow reasoning (8766, same pattern as `/scene`):** add two **[Log](https://docs.foxglove.dev/docs/visualization/panels/log)** panels. Point one at topic **`/scout_fast_reasoning`** and the other at **`/scout_slow_reasoning`** on the **8766** connection. Both channels use the **`foxglove.Log`** schema (typed MCAP), like `/scene` uses `SceneUpdate`. Fast loop shows live narrative plus `tick_id` / `streaming` in the log line prefix; slow loop shows one pretty-printed JSON snapshot per tactical cycle. **Robot commands always follow the slow loop**, not the fast commentary alone.
 
-ROS topic `/viz/fire_image` remains available for nodes and for debugging; the scout consumes the rendered bird’s-eye view path via the bridge as designed.
+ROS topic `/viz/fire_image` remains available for nodes and for debugging; the bridge still receives the rendered bird’s-eye image on `/viz/fire_image`.
 
 ## Repository layout
 
@@ -210,9 +216,9 @@ BeachHacks2026/
 
 3. **`scene_publisher_3d`** streams procedural 3D terrain, trees, rocks, fire, and robots on WebSocket **8766** (`/scene`, `/tf`).
 
-4. **`ScoutADKAgent`** uses grid state + firefighter state: a **deterministic** path when rules fully decide moves; otherwise **one Gemini call** returns JSON assignments. **`ScoutUAgent`** (port **8000**) carries uAgent messaging; firefighters listen on **8001+**.
+4. **`ScoutADKAgent`** runs two Gemini-related cadences: a **fast loop** (`run_reasoning_stream`) streams plain-text situation commentary into a thread-safe buffer and a **timestamped timeline**; a **slow loop** (`run_analysis`) repositions the scout, then either uses a **deterministic** path or **one structured Gemini call** for JSON assignments. The tactical prompt sees only commentary from roughly the **last 10 seconds** of that timeline (override with `SLOW_LOOP_REASONING_WINDOW_SEC`) as **non-authoritative** context (grid telemetry wins on conflict). **`ScoutUAgent`** (port **8000**) carries uAgent messaging; firefighters listen on **8001+**.
 
-5. **`ros_bridge`** runs uAgents on background threads and maps ROS topics ↔ agent commands.
+5. **`ros_bridge`** runs uAgents on background threads, maps ROS topics ↔ agent commands, publishes JSON on **`/scout/reasoning_status`** and **`/scout/decision_snapshot`** for `foxglove_viz`.
 
 6. **`sim_odom_node`** integrates motion for the demo (no full Gazebo robot plugins required for the grid-driven behavior).
 
@@ -234,7 +240,7 @@ fire_grid_node:
     fire_start_y: 12.0
 ```
 
-**Bridge / scout intervals** — `src/wildfire_agents/config/agent_config.yaml` (`scout_port`, `analysis_interval`, etc.).
+**Bridge / scout intervals** — `src/wildfire_agents/config/agent_config.yaml`: `analysis_interval` (slow loop), `reasoning_interval` (fast loop), `scout_port`, etc. Environment variables `ANALYSIS_INTERVAL` and `REASONING_INTERVAL` override these after install.
 
 ## License
 

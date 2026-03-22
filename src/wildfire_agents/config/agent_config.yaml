@@ -3,4 +3,5 @@ ros_bridge:
     num_firefighters: 4
     use_vlm: true
     analysis_interval: 10.0
+    reasoning_interval: 5.0
     scout_port: 8000

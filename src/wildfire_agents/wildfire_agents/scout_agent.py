@@ -11,10 +11,13 @@ The bridge calls ``run_analysis()`` on a timer.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+import threading
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -33,9 +36,20 @@ MAX_ALTITUDE = 40.0
 REFILL_WATER_THRESHOLD = 20.0
 FIRE_CELL_THRESHOLD = 0.1
 
+REASONING_MAX_CHARS = 8000
+
 ASSIGNMENT_PROMPT = """\
 You are a wildfire tactical coordinator.  Given the current fire state and
 firefighter positions, decide what each firefighter should do.
+
+## Reference — scout narrative (may be stale)
+The following is **only the scout's commentary produced in approximately the
+last {reasoning_window_sec} seconds** (for context). **Trust the structured
+state in the next section** for all coordinates and facts. If the narrative
+disagrees with `fire`, `perimeter_positions`, or firefighter telemetry,
+**ignore the narrative**.
+
+{narrative_excerpt}
 
 ## Rules
 - NEVER send a firefighter onto a burning cell.
@@ -94,7 +108,7 @@ firefighter positions, decide what each firefighter should do.
 - After rescue needs are addressed, return to **wide spacing** for everyone
   you move (same rules as the Spacing section).
 
-## State
+## State (authoritative)
 {state_json}
 
 ## Response format — ONLY valid JSON, no markdown fences
@@ -112,6 +126,19 @@ firefighter positions, decide what each firefighter should do.
 pair from the perimeter list.
 """
 
+REASONING_PROMPT = """\
+You are a scout drone narrating the wildfire firefighting simulation for human
+operators. Respond in plain text only (no JSON, no markdown fences).
+
+## Situation (JSON)
+{snapshot}
+
+## Instructions
+Write 2–4 short sentences: fire threat, spread concern, each firefighter's
+role or risk, and what you will watch next. Be concrete; do not invent
+coordinates not implied by the JSON.
+"""
+
 
 class ScoutADKAgent:
     """Single-shot scout agent: deterministic positioning + one LLM call."""
@@ -120,9 +147,11 @@ class ScoutADKAgent:
         self,
         use_vlm: bool = True,
         analysis_interval: float = 20.0,
+        reasoning_interval: float = 5.0,
     ):
         self.use_vlm = use_vlm
         self.analysis_interval = analysis_interval
+        self.reasoning_interval = reasoning_interval
 
         self.fire_grid: Optional[List[float]] = None
         self.grid_size: int = 50
@@ -133,14 +162,30 @@ class ScoutADKAgent:
 
         self.water_supply_position = [0.0, 0.0]
 
+        self._reasoning_lock = threading.Lock()
+        self.reasoning_text: str = ""
+        self.reasoning_updated_monotonic: float = 0.0
+        self._reasoning_streaming: bool = False
+        self._reasoning_tick_id: int = 0
+        self._reasoning_wall_time: float = 0.0
+        self._last_compact_snapshot: Optional[dict] = None
+        # (wall_time, text_fragment) — slow loop uses last N seconds only
+        self._reasoning_timeline: List[Tuple[float, str]] = []
+        self._slow_loop_reasoning_window_sec = float(
+            os.environ.get("SLOW_LOOP_REASONING_WINDOW_SEC", "10"))
+
         # Callbacks wired by the bridge
         self.on_move_scout: Optional[callable] = None
         self.on_assign_firefighter: Optional[callable] = None
         self.on_refill_firefighter: Optional[callable] = None
+        self.on_decision_snapshot: Optional[Callable[[dict[str, Any]], None]] = None
 
         self._model_name = os.environ.get("ADK_MODEL", "gemini-2.5-flash-lite")
+        self._reasoning_model_name = os.environ.get(
+            "REASONING_MODEL", "gemini-2.5-flash-lite")
         api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
         self._client = genai.Client(api_key=api_key)
+        self._api_key_set = bool(api_key)
 
     # -- public interface (called by ros_bridge timer) -----------------------
 
@@ -165,8 +210,10 @@ class ScoutADKAgent:
         assignments = self._try_deterministic_assignments(
             fire_status, perimeter, ff_positions)
         summary = None
+        used_llm = False
 
         if assignments is None:
+            used_llm = True
             assignments, summary = await self._call_gemini(
                 fire_status, perimeter, ff_positions)
 
@@ -174,6 +221,16 @@ class ScoutADKAgent:
 
         if summary:
             print(f"[SCOUT] {summary}")
+
+        if self.on_decision_snapshot:
+            preview = self._reasoning_narrative_for_prompt(400)
+            self.on_decision_snapshot({
+                "assignments": assignments or [],
+                "scout_summary": summary or "",
+                "source": "gemini" if used_llm else "deterministic",
+                "wall_time": time.time(),
+                "reasoning_excerpt_preview": preview,
+            })
 
     # -- deterministic scout positioning ------------------------------------
 
@@ -313,6 +370,159 @@ class ScoutADKAgent:
                 best_i = i
         return best_i
 
+    def _prune_reasoning_timeline_locked(self, now: float) -> None:
+        """Remove timeline entries older than the slow-loop window (lock held)."""
+        cutoff = now - self._slow_loop_reasoning_window_sec
+        self._reasoning_timeline = [
+            (t, s) for t, s in self._reasoning_timeline if t >= cutoff]
+
+    def _append_reasoning_timeline_locked(
+            self, now: float, fragment: str) -> None:
+        if not fragment:
+            return
+        self._prune_reasoning_timeline_locked(now)
+        self._reasoning_timeline.append((now, fragment))
+
+    def _reasoning_narrative_for_prompt(self, max_chars: int = 2000) -> str:
+        now = time.time()
+        cutoff = now - self._slow_loop_reasoning_window_sec
+        with self._reasoning_lock:
+            self._prune_reasoning_timeline_locked(now)
+            parts = [s for t, s in self._reasoning_timeline if t >= cutoff]
+            text = "".join(parts).strip()
+        if not text:
+            return "(no scout commentary yet)"
+        return text[:max_chars]
+
+    def get_reasoning_status_dict(self) -> dict:
+        with self._reasoning_lock:
+            return {
+                "text": self.reasoning_text,
+                "updated_sec": self._reasoning_wall_time,
+                "tick_id": self._reasoning_tick_id,
+                "streaming": self._reasoning_streaming,
+            }
+
+    def _compact_situation_snapshot(self) -> dict:
+        if self.fire_grid is None:
+            return {"status": "no_grid"}
+        fire_status = self._fire_status()
+        ff_compact = {}
+        for ff_id, st in self.firefighter_status.items():
+            x, y = st["position"]
+            in_danger, reason = self._firefighter_in_danger((x, y))
+            ff_compact[ff_id] = {
+                "position": [round(x, 2), round(y, 2)],
+                "water_level": round(st["water_level"], 1),
+                "state": st["state"],
+                "in_danger": in_danger,
+                "danger_reason": reason,
+            }
+        prev = self._last_compact_snapshot
+        delta_note = None
+        if prev is not None:
+            prev_burn = prev.get("fire", {}).get("burning_cells")
+            if prev_burn is not None:
+                delta_note = {
+                    "burning_cells_delta": (
+                        fire_status["burning_cells"] - prev_burn),
+                }
+        snap = {
+            "fire": {
+                "burning_cells": fire_status["burning_cells"],
+                "threat_level": fire_status.get("threat_level"),
+                "centroid": fire_status.get("centroid"),
+            },
+            "firefighters": ff_compact,
+            "delta_since_last_tick": delta_note,
+        }
+        self._last_compact_snapshot = {
+            "fire": {"burning_cells": fire_status["burning_cells"]},
+        }
+        return snap
+
+    async def run_reasoning_stream(self):
+        """Fast loop: stream plain-text commentary into ``reasoning_text``."""
+        if not self._api_key_set:
+            now = time.time()
+            msg = (
+                "[reasoning offline: set GOOGLE_API_KEY or GEMINI_API_KEY]")
+            with self._reasoning_lock:
+                self.reasoning_text = msg
+                self.reasoning_updated_monotonic = time.monotonic()
+                self._reasoning_wall_time = now
+                self._append_reasoning_timeline_locked(now, msg)
+            return
+        if self.fire_grid is None:
+            return
+        fire_status = self._fire_status()
+        if fire_status["burning_cells"] == 0:
+            return
+
+        self._reasoning_tick_id += 1
+        with self._reasoning_lock:
+            self._reasoning_streaming = True
+
+        compact = self._compact_situation_snapshot()
+        user_content = REASONING_PROMPT.format(
+            snapshot=json.dumps(compact, indent=2))
+
+        def _stream_worker():
+            try:
+                stream_method = getattr(
+                    self._client.models, "generate_content_stream", None)
+                if stream_method is None:
+                    resp = self._client.models.generate_content(
+                        model=self._reasoning_model_name,
+                        contents=user_content,
+                        config=types.GenerateContentConfig(
+                            temperature=0.35,
+                            max_output_tokens=512,
+                        ),
+                    )
+                    t = (resp.text or "").strip()
+                    now = time.time()
+                    with self._reasoning_lock:
+                        self.reasoning_text = t[-REASONING_MAX_CHARS:]
+                        self.reasoning_updated_monotonic = time.monotonic()
+                        self._reasoning_wall_time = now
+                        self._append_reasoning_timeline_locked(now, t)
+                    return
+                buf: List[str] = []
+                for chunk in stream_method(
+                    model=self._reasoning_model_name,
+                    contents=user_content,
+                    config=types.GenerateContentConfig(
+                        temperature=0.35,
+                        max_output_tokens=512,
+                    ),
+                ):
+                    piece = getattr(chunk, "text", None) or ""
+                    if not piece:
+                        continue
+                    buf.append(piece)
+                    combined = "".join(buf)[-REASONING_MAX_CHARS:]
+                    now = time.time()
+                    with self._reasoning_lock:
+                        self.reasoning_text = combined
+                        self.reasoning_updated_monotonic = time.monotonic()
+                        self._reasoning_wall_time = now
+                        self._append_reasoning_timeline_locked(now, piece)
+            except Exception as exc:
+                err = f"[reasoning error: {exc}]"
+                now = time.time()
+                with self._reasoning_lock:
+                    self.reasoning_text = err
+                    self.reasoning_updated_monotonic = time.monotonic()
+                    self._reasoning_wall_time = now
+                    self._append_reasoning_timeline_locked(now, err)
+                print(f"[SCOUT] reasoning stream failed: {exc}")
+            finally:
+                with self._reasoning_lock:
+                    self._reasoning_streaming = False
+
+        await asyncio.to_thread(_stream_worker)
+
     # -- single Gemini API call ---------------------------------------------
 
     async def _call_gemini(self, fire_status, perimeter, ff_positions):
@@ -340,11 +550,17 @@ class ScoutADKAgent:
             },
         }
 
-        prompt = ASSIGNMENT_PROMPT.format(state_json=json.dumps(state, indent=2))
+        narrative = self._reasoning_narrative_for_prompt()
+        rw = self._slow_loop_reasoning_window_sec
+        rw_str = str(int(rw)) if rw == int(rw) else str(rw)
+        prompt = ASSIGNMENT_PROMPT.format(
+            reasoning_window_sec=rw_str,
+            narrative_excerpt=narrative,
+            state_json=json.dumps(state, indent=2),
+        )
 
         print(f"[SCOUT] Calling Gemini ({self._model_name}) …")
         try:
-            import asyncio
             response = await asyncio.to_thread(
                 self._client.models.generate_content,
                 model=self._model_name,

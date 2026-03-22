@@ -6,9 +6,12 @@ Subscribes to /fire_grid and robot odometry, publishes 3D scene updates
 via the foxglove-sdk (SceneUpdate) so Foxglove's 3D panel can render
 terrain (from Depth Anything), trees, rocks, fire, and robots.
 
-Connects to the foxglove server started by foxglove_viz on port 8766.
+Starts its own Foxglove WebSocket server on port **8766** (same connection
+as typed ``/scene`` / ``/tf``). Scout fast/slow reasoning is published here
+as ``foxglove.Log`` on ``/scout_fast_reasoning`` and ``/scout_slow_reasoning``.
 """
 
+import json
 import math
 import os
 import time
@@ -22,7 +25,7 @@ from foxglove import schemas as fgs
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, String
 from wildfire_msgs.msg import FireGrid
 
 
@@ -48,6 +51,23 @@ def _fg_vec3(x, y, z):
 def _fg_ts():
     t = time.time_ns()
     return fgs.Timestamp(sec=t // 1_000_000_000, nsec=t % 1_000_000_000)
+
+
+def _fg_log_level_info():
+    """``foxglove.Log.level`` must be ``LogLevel`` enum; SDK exposes ``Info`` (TitleCase), not ``INFO``/int."""
+    return fgs.LogLevel.Info
+
+
+def _fg_scout_log(message: str, name: str) -> fgs.Log:
+    """Typed Log message — use with Foxglove **Log** panel like other MCAP channels."""
+    return fgs.Log(
+        timestamp=_fg_ts(),
+        level=_fg_log_level_info(),
+        message=message,
+        name=name,
+        file='',
+        line=0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -111,11 +131,17 @@ class ScenePublisher3D(Node):
         self._last_fire = None
         self.create_subscription(FireGrid, '/fire_grid', self._fire_cb, 10)
 
+        self.create_subscription(
+            String, '/scout/reasoning_status', self._scout_reasoning_ros_cb, 10)
+        self.create_subscription(
+            String, '/scout/decision_snapshot', self._scout_decision_ros_cb, 10)
+
         self.create_timer(0.2, self._publish_robots)
 
         self.get_logger().info(
             f'ScenePublisher3D started — ws://localhost:8766 — {num_ff} firefighters, '
-            f'{TREE_COUNT} trees, {ROCK_COUNT} rocks')
+            f'{TREE_COUNT} trees, {ROCK_COUNT} rocks — '
+            f'Log topics /scout_fast_reasoning, /scout_slow_reasoning')
 
     # -----------------------------------------------------------------------
     # Terrain generation
@@ -309,6 +335,42 @@ class ScenePublisher3D(Node):
     def _fire_cb(self, msg: FireGrid):
         self._last_fire = msg
         self._publish_fire(msg)
+
+    def _scout_reasoning_ros_cb(self, msg: String):
+        """Fast loop: mirror streaming reasoning as foxglove.Log (same WS as /scene)."""
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            data = {'text': msg.data, 'parse_error': True}
+        text = (data.get('text') or '').strip()
+        parts = []
+        if data.get('tick_id') is not None:
+            parts.append(f"tick_id={data['tick_id']}")
+        if data.get('streaming'):
+            parts.append('streaming')
+        us = data.get('updated_sec')
+        if us is not None:
+            try:
+                parts.append(f'updated_sec={float(us):.3f}')
+            except (TypeError, ValueError):
+                parts.append(f'updated_sec={us!r}')
+        header = f"[{' | '.join(parts)}]\n" if parts else ''
+        foxglove.log(
+            '/scout_fast_reasoning',
+            _fg_scout_log(header + text, 'scout_fast_reasoning'),
+        )
+
+    def _scout_decision_ros_cb(self, msg: String):
+        """Slow loop: tactical snapshot as foxglove.Log (JSON body)."""
+        try:
+            data = json.loads(msg.data)
+            body = json.dumps(data, indent=2)
+        except json.JSONDecodeError:
+            body = msg.data
+        foxglove.log(
+            '/scout_slow_reasoning',
+            _fg_scout_log(body, 'scout_slow_reasoning'),
+        )
 
     # -----------------------------------------------------------------------
     # Fire (updated every fire grid tick)

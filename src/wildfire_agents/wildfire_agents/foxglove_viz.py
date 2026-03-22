@@ -4,8 +4,9 @@ Foxglove visualization node.
 
 Subscribes to /fire_grid and firefighter topics, renders a bird's-eye image,
 publishes it as sensor_msgs/Image on /viz/fire_image (consumed by ros_bridge
-for VLM), and streams everything to Foxglove Studio via the foxglove-sdk
-WebSocket server (port 8766).
+for VLM), and streams 2D viz to Foxglove Studio via the foxglove-sdk
+WebSocket server (port **8765**). Scout reasoning Log channels are on **8766**
+(see ``scene_publisher_3d``).
 """
 
 import os
